@@ -1,7 +1,7 @@
-# app.py — Amount + Date Finder (always checks Credit & Debit)
+# app.py — Amount + Date Finder → export by BANK sheet (SNB / SABB / etc.)
 # Input Excel columns: AMOUNT | DATE
-# Output: One Excel with a sheet per input row containing all matches (Date >=, Amount match).
-# Dependencies: streamlit==1.28.0, pandas==2.0.3, numpy==1.24.3, openpyxl==3.1.2, xlrd==2.0.1
+# Output: Excel with one sheet per detected bank; also an "All_Matches" overview sheet.
+# Requirements: streamlit==1.28.0, pandas==2.0.3, numpy==1.24.3, openpyxl==3.1.2, xlrd==2.0.1
 
 import io
 import re
@@ -16,6 +16,26 @@ import streamlit as st
 
 st.set_page_config(page_title="Amount + Date Finder", page_icon="🔎", layout="wide")
 
+# ----------------------- Bank aliases (for sheet names) -----------------------
+BANK_ALIASES: Dict[str, List[str]] = {
+    "SNB":  ["SNB","NCB","Saudi National","Saudi National Bank","National Commercial","ALAHLI","AL AHLI","AHLI","AL-AHLI","الاهلي","الأهلي"],
+    "SABB": ["SABB","AWWAL","HSBC","الأول","ساب"],
+    "ARB":  ["ARB","AL RAJHI","ALRAJHI","RAJHI","AL-RAJHI","الراجحي","مصرف الراجحي"],
+    "BSF":  ["BSF","SAUDI FRANSI","FRANSI","البنك السعودي الفرنسي","فرنسي"],
+    "RIB":  ["RIB","RIYAD","RIYAD BANK","RIYADH BANK","RIYADBANK","بنك الرياض","الرياض"],
+    "INMA": ["INMA","ALINMA","AL INMA","AL-INMA","INMAA","مصرف الإنماء","الإنماء","الانماء"],
+    "ANB":  ["ANB","Arab National Bank","العربي","البنك العربي الوطني"],
+}
+
+def _detect_bank_from_filename(filename: str) -> str:
+    """Return canonical bank code by matching aliases in the filename."""
+    fn = (filename or "").lower()
+    for code, aliases in BANK_ALIASES.items():
+        for a in aliases:
+            if a.lower() in fn:
+                return code
+    return "OTHER"
+
 # ----------------------- Heuristics -----------------------
 
 MONEY_TOKENS = [
@@ -27,18 +47,35 @@ DATE_TOKENS = [
     "تاريخ", "تاريخ العملية", "تاريخ المعاملة", "قيمة التاريخ"
 ]
 
-CURRENCY_RE = re.compile(r"[^\d\-\.\(\)]", re.UNICODE)
+CURRENCY_RE = re.compile(r"[^\d\.\-]", re.UNICODE)
+ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
 
 def _clean_amount(x) -> Optional[float]:
+    """Robust money parser: Arabic digits, trailing minus/plus, parentheses negatives."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
     s = str(x).strip()
     if s == "":
         return None
-    s = CURRENCY_RE.sub("", s.replace(",", "").replace(" ", ""))
-    neg = s.startswith("(") and s.endswith(")")
-    if neg:
+    s = s.translate(ARABIC_DIGITS)
+    s = s.replace("\u200f","").replace("\u200e","").replace("\u202a","").replace("\u202b","").replace("\u202c","")
+    s = s.replace("SAR","").replace("ر.س","").replace("ريال","").replace("﷼","").replace(" ","")
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
         s = s[1:-1]
+    if len(s) > 1 and s[-1] in "+-":
+        if s[-1] == "-":
+            neg = not neg if s.startswith("-") else True
+        s = s[:-1]
+    s = s.replace(",", "")
+    s = CURRENCY_RE.sub("", s)
+    if s.count("-") > 1:
+        s = s.replace("-", "")
+        s = "-" + s
+    if "-" in s and not s.startswith("-"):
+        s = s.replace("-", "")
+        s = "-" + s
     try:
         v = float(s)
         if neg:
@@ -84,7 +121,6 @@ def _bytes_from_uploader(uploaded_files) -> List[Tuple[str, bytes]]:
         else:
             collected.append((name, data))
     collected = [(n, b) for (n, b) in collected if n.lower().endswith((".xlsx", ".xls"))]
-    # de-dup by filename+hash
     seen = set()
     uniq = []
     for (n, b) in collected:
@@ -148,13 +184,7 @@ def _guess_amount_column(df: pd.DataFrame) -> Optional[str]:
 
 def _normalize_ledger(df: pd.DataFrame, amount_cands: List[str], date_cands: List[str],
                       enable_debit_credit=True, auto_date=True):
-    """
-    Returns df with normalized columns:
-      _DATE_   : parsed datetime
-      _SIGNED_ : signed amount (credit - debit if pair exists, else the single detected amount column)
-      _CREDIT_, _DEBIT_ : explicit columns when available
-    Also returns an info dict describing which columns were used.
-    """
+    """Normalize a sheet to: _DATE_, _SIGNED_, _CREDIT_, _DEBIT_."""
     info = {"amt_col": None, "date_col": None, "credit_col": None, "debit_col": None,
             "net_logic": False, "amt_auto": False, "date_auto": False}
     if df.empty:
@@ -163,7 +193,6 @@ def _normalize_ledger(df: pd.DataFrame, amount_cands: List[str], date_cands: Lis
 
     amt_col = _first_present(df, amount_cands)
 
-    # BSF patterns like "Credit (SAR)" / "Debit (SAR)"
     credit_sar = _find_col_regex(df, [r"\bcredit\s*\(sar\)\b", r"\bcredit\s*\(s\.?a\.?r\.?\)\b"])
     debit_sar  = _find_col_regex(df,  [r"\bdebit\s*\(sar\)\b",  r"\bdebit\s*\(s\.?a\.?r\.?\)\b"])
 
@@ -256,31 +285,29 @@ with c4:
 with c5:
     auto_detect_date = st.checkbox("Auto-detect Date column if not found", value=True)
 
+include_overview = st.checkbox("Include 'All_Matches' overview sheet", value=True)
+
 run_btn = st.button("🔎 Find", type="primary", use_container_width=True)
 
 # ----------------------- Main -----------------------
 
 if run_btn:
     if not input_file:
-        st.error("Upload the Input Excel.")
-        st.stop()
+        st.error("Upload the Input Excel."); st.stop()
     if not stmt_files:
-        st.error("Upload statements (or a ZIP).")
-        st.stop()
+        st.error("Upload statements (or a ZIP)."); st.stop()
 
     # Read input
     try:
         df_in = pd.read_excel(input_file, dtype=object)
         df_in = _norm_cols(df_in)
     except Exception as e:
-        st.error(f"Failed to read Input: {e}")
-        st.stop()
+        st.error(f"Failed to read Input: {e}"); st.stop()
 
     m = {c.lower(): c for c in df_in.columns}
     c_amt_in = m.get("amount"); c_date_in = m.get("date")
     if not (c_amt_in and c_date_in):
-        st.error("Input must have columns: AMOUNT and DATE.")
-        st.stop()
+        st.error("Input must have columns: AMOUNT and DATE."); st.stop()
 
     df_in["_AMOUNT"] = df_in[c_amt_in].apply(_clean_amount)
     df_in["_DATE"]   = df_in[c_date_in].apply(_parse_date)
@@ -289,15 +316,13 @@ if run_btn:
     if len(df_in) < before:
         st.warning(f"Skipped {before - len(df_in):,} invalid row(s).")
     if df_in.empty:
-        st.error("No valid rows after cleaning.")
-        st.stop()
+        st.error("No valid rows after cleaning."); st.stop()
 
     files = _bytes_from_uploader(stmt_files)
     with st.expander("Uploaded files", expanded=False):
         st.write([n for n,_ in files] or "No Excel files uploaded.")
     if not files:
-        st.error("No readable Excel files found.")
-        st.stop()
+        st.error("No readable Excel files found."); st.stop()
 
     amt_cands  = [s.strip() for s in amount_candidates_text.split(",") if s.strip()]
     date_cands = [s.strip() for s in date_candidates_text.split(",") if s.strip()]
@@ -306,7 +331,7 @@ if run_btn:
     repo: Dict[str, Dict[str, pd.DataFrame]] = {}
     diag_rows = []
 
-    with st.status("Reading & normalizing statements…", expanded=False) as st_read:
+    with st.status("Reading & normalizing…", expanded=False) as st_read:
         for (fname, fbytes) in files:
             try:
                 sheets = _read_all_sheets(fbytes, fname)
@@ -315,10 +340,8 @@ if run_btn:
                 continue
             repo[fname] = {}
             for sname, df in sheets.items():
-                df_norm, info = _normalize_ledger(
-                    df.copy(), amt_cands, date_cands,
-                    enable_debit_credit=True, auto_date=auto_detect_date
-                )
+                df_norm, info = _normalize_ledger(df.copy(), amt_cands, date_cands,
+                                                  enable_debit_credit=True, auto_date=auto_detect_date)
                 repo[fname][sname] = df_norm
                 n_amt = df_norm["_SIGNED_"].notna().sum()
                 n_dt  = df_norm["_DATE_"].notna().sum()
@@ -340,25 +363,23 @@ if run_btn:
 
     # Search
     tol = 0.0 if exact_amount else 0.01
-    per_input_matches: Dict[int, pd.DataFrame] = {}
-    summary_rows = []
+    matched_rows = []
 
     with st.status("Searching…", expanded=False) as st_find:
         for idx, row in df_in.iterrows():
             amt_in = float(abs(row["_AMOUNT"]) if use_abs else row["_AMOUNT"])
             d0 = row["_DATE"]
-
-            found_parts = []
             for fname in repo:
+                bank_code = _detect_bank_from_filename(fname)
                 for sname, d in repo[fname].items():
                     if d.empty or d["_DATE_"].isna().all():
                         continue
 
                     series_amt = d["_SIGNED_"]
 
-                    # ALWAYS consider both sides + explicit credit/debit
+                    # consider both signs + explicit credit/debit
                     mask_signed_pos = (series_amt -  amt_in).abs() <= tol
-                    mask_signed_neg = (series_amt +  amt_in).abs() <= tol   # catches -amount
+                    mask_signed_neg = (series_amt +  amt_in).abs() <= tol
                     mask_credit     = (d["_CREDIT_"].fillna(0) - amt_in).abs() <= tol
                     mask_debit      = (d["_DEBIT_"].fillna(0)  - amt_in).abs() <= tol
                     mask_abs        = (series_amt.abs() - amt_in).abs() <= tol if use_abs else False
@@ -369,49 +390,42 @@ if run_btn:
 
                     if mask.any():
                         m = d.loc[mask].copy()
-                        m.insert(0, "Source File", fname)
-                        m.insert(1, "Sheet", sname)
-                        m.insert(2, "AMOUNT (Input)", amt_in)
-                        m.insert(3, "DATE From (Input)", pd.to_datetime(d0).date())
-                        found_parts.append(m)
+                        m.insert(0, "Bank (Detected)", bank_code)
+                        m.insert(1, "Source File", fname)
+                        m.insert(2, "Sheet", sname)
+                        m.insert(3, "AMOUNT (Input)", amt_in)
+                        m.insert(4, "DATE From (Input)", pd.to_datetime(d0).date())
+                        m.insert(5, "Input Row", int(idx)+1)
+                        matched_rows.append(m)
 
-            if found_parts:
-                per_input_matches[idx] = pd.concat(found_parts, ignore_index=True)
-                total = len(per_input_matches[idx])
-            else:
-                per_input_matches[idx] = pd.DataFrame()
-                total = 0
-
-            summary_rows.append({
-                "Input Row": int(idx)+1,
-                "AMOUNT": amt_in,
-                "DATE From": pd.to_datetime(d0).date(),
-                "Matches": total
-            })
         st_find.update(label="Done.", state="complete")
 
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
-
-    if all(df.empty for df in per_input_matches.values()):
-        st.warning("No matches found for any input rows.")
+    if not matched_rows:
+        st.warning("No matches found.")
         st.stop()
 
-    # Export: one sheet per input row
+    all_matches = pd.concat(matched_rows, ignore_index=True).drop_duplicates()
+
+    # ----------------------- Export by BANK sheets -----------------------
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        for idx, dfm in per_input_matches.items():
-            sheet_title = f"Row{idx+1}_Amt_{str(df_in.loc[idx, '_AMOUNT']).replace('.', '_')}"
-            sheet_title = sheet_title[:31].translate(str.maketrans({":":"-","/":"-","\\":"-","*":"-","?":"-","[":"(","]":")"}))
-            if dfm.empty:
-                pd.DataFrame([{"Note":"No matches"}]).to_excel(writer, index=False, sheet_name=sheet_title)
-            else:
-                dfm.drop_duplicates().to_excel(writer, index=False, sheet_name=sheet_title)
+        if include_overview:
+            # Small overview: counts by bank and input row
+            ov = (all_matches.groupby(["Bank (Detected)","Input Row"], as_index=False)
+                  .size().rename(columns={"size":"Matches"}))
+            ov.to_excel(writer, index=False, sheet_name="All_Matches")
+
+        for bank_code, dfb in all_matches.groupby("Bank (Detected)"):
+            sheet = (bank_code or "OTHER")[:31]
+            dfb.to_excel(writer, index=False, sheet_name=sheet)
+
     out.seek(0)
+    st.success(f"Saved {len(all_matches):,} rows across {all_matches['Bank (Detected)'].nunique():,} bank sheet(s).")
 
     st.download_button(
-        "⬇️ Download Matches (Excel: sheet per input row)",
+        "⬇️ Download Excel (sheets by bank)",
         data=out.getvalue(),
-        file_name=f"AmountDate_Matches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        file_name=f"AmountDate_ByBank_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
