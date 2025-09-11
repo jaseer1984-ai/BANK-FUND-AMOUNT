@@ -1,7 +1,11 @@
-# app.py — Amount + Date Finder (grouped by BANK)
-# Fix: parse "slash dates" as day-first so 10/9/2025 => 10-Sep-2025.
-# Output: Excel with one sheet per detected bank (+ optional All_Matches).
-# Requirements: streamlit==1.28.0, pandas==2.0.3, numpy==1.24.3, openpyxl==3.1.2, xlrd==2.0.1
+# Amount + Date Finder — grouped by BANK (SIB/SAIB supported), Hijri avoided, day-first dates,
+# and a sheet is always created per detected bank (even with 0 matches).
+# Requirements:
+# streamlit==1.28.0
+# pandas==2.0.3
+# numpy==1.24.3
+# openpyxl==3.1.2
+# xlrd==2.0.1
 
 import io, re, zipfile, hashlib
 from datetime import datetime
@@ -13,10 +17,10 @@ import streamlit as st
 
 st.set_page_config(page_title="Amount + Date Finder", page_icon="🔎", layout="wide")
 
-# ---------------- Bank aliases (includes SIB/SAIB) ----------------
+# --------- Bank aliases (includes SIB/SAIB) ----------
 BANK_ALIASES: Dict[str, List[str]] = {
     "SNB":  ["SNB","NCB","Saudi National","Saudi National Bank","National Commercial","ALAHLI","AL AHLI","AHLI","AL-AHLI","الاهلي","الأهلي"],
-    "SABB": ["SABB","AWWAL","HSBC","الأول","ساب"],
+    "SBB":  ["SBB","AWWAL","HSBC","الأول","ساب"],
     "ARB":  ["ARB","AL RAJHI","ALRAJHI","RAJHI","AL-RAJHI","الراجحي","مصرف الراجحي"],
     "BSF":  ["BSF","SAUDI FRANSI","FRANSI","البنك السعودي الفرنسي","فرنسي"],
     "RIB":  ["RIB","RIYAD","RIYAD BANK","RIYADH BANK","RIYADBANK","بنك الرياض","الرياض"],
@@ -34,13 +38,17 @@ def _detect_bank(filename: str, sheetname: str, df: pd.DataFrame) -> str:
                 if a.lower() in s:
                     return code
         return None
+
     for s in (filename, sheetname):
         code = hit(s)
-        if code: return code
+        if code:
+            return code
     code = hit(" ".join(map(str, df.columns)))
-    if code: return code
-    top = " ".join(df.head(15).astype(str).fillna("").values.ravel().tolist())
+    if code:
+        return code
+    top = " ".join(df.head(20).astype(str).fillna("").values.ravel().tolist())
     return hit(top) or "OTHER"
+
 
 # ---------------- Parsing helpers ----------------
 MONEY_TOKENS = ["amount","credit","debit","value","sar","balance","رصيد","مبلغ","مدين","دائن","قيمة","ائتمان"]
@@ -48,6 +56,7 @@ DATE_TOKENS  = ["date","value date","posting","transaction","txn","val","تار�
 
 CURRENCY_RE = re.compile(r"[^\d\.\-]", re.UNICODE)
 ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
+_SLASH_DATE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
 
 def _clean_amount(x) -> Optional[float]:
     """Arabic digits, trailing +/- sign, parentheses negatives, currency junk."""
@@ -72,15 +81,12 @@ def _clean_amount(x) -> Optional[float]:
     except Exception:
         return None
 
-_SLASH_DATE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
-
 def _parse_date(v) -> Optional[pd.Timestamp]:
-    """Parse date; if it's a slash style (e.g., 10/9/2025), treat as **day-first**."""
+    """Parse date; treat slash dates day-first (10/9/2025 => 10-Sep-2025)."""
     if pd.isna(v) or str(v).strip() == "": return None
     s = str(v).strip()
     if _SLASH_DATE_RE.match(s):
         return pd.to_datetime(s, errors="coerce", dayfirst=True)
-    # words like '11 Sep 2025' parse fine; Excel serials also fine
     return pd.to_datetime(v, errors="coerce")
 
 def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -98,7 +104,7 @@ def _extract_files_from_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
         for zi in zf.infolist():
             name = zi.filename
             if name.endswith("/") or name.startswith("__MACOSX"): continue
-            if name.lower().endswith((".xlsx", ".xls")): out.append((name.split("/")[-1], zf.read(zi)))
+            if name.lower().endswith((".xlsx",".xls")): out.append((name.split("/")[-1], zf.read(zi)))
     return out
 
 def _bytes_from_uploader(uploaded_files) -> List[Tuple[str, bytes]]:
@@ -132,32 +138,32 @@ def _find_col_regex(df: pd.DataFrame, patterns: List[str]) -> Optional[str]:
 def _guess_date_column(df: pd.DataFrame) -> Optional[str]:
     """Prefer Gregorian columns and penalize Hijri-named ones."""
     best_col, best_score = None, -1e9
-    total = len(df)
+    total=len(df)
     for c in df.columns:
-        name = str(c).lower()
+        name=str(c).lower()
         bias = -0.5 if ("hijri" in name or "hijrah" in name) else 0.0
-        ser = pd.to_datetime(df[c], errors="coerce")
-        valid = ser.notna().sum()
-        if valid == 0: continue
-        yrs = ser.dt.year.dropna()
-        within = ((yrs>=2000) & (yrs<=2035)).mean() if len(yrs) else 0
-        name_bonus = 0.6 if "value date" in name else (0.4 if ("posted" in name or "posting" in name) else 0.0)
-        score = valid/max(total,1) + 2.0*within + name_bonus + bias
-        if score > best_score:
-            best_col, best_score = c, score
+        ser = df[c].apply(_parse_date)  # << use our dayfirst-aware parser
+        valid=ser.notna().sum()
+        if valid==0: continue
+        yrs=ser.dt.year.dropna()
+        within=((yrs>=2000)&(yrs<=2035)).mean() if len(yrs) else 0
+        name_bonus=0.6 if "value date" in name else (0.4 if ("posted" in name or "posting" in name) else 0.0)
+        score=valid/max(total,1) + 2.0*within + name_bonus + bias
+        if score>best_score:
+            best_col, best_score=c, score
     return best_col
 
 def _guess_amount_column(df: pd.DataFrame) -> Optional[str]:
     if df is None or df.empty: return None
-    best_col, best_score = None, -1.0
+    best_col, best_score=None, -1.0
     for c in df.columns:
         lc=str(c).lower()
         if not any(tok in lc for tok in ["amount","credit","debit","balance","الرصيد","مبلغ","مدين","دائن"]): 
             continue
-        cleaned = df[c].apply(_clean_amount)
-        valid = cleaned.notna().sum()
-        if valid > best_score:
-            best_col, best_score = c, valid
+        cleaned=df[c].apply(_clean_amount)
+        valid=cleaned.notna().sum()
+        if valid>best_score:
+            best_col, best_score=c, valid
     return best_col
 
 def _normalize_ledger(df: pd.DataFrame, amount_cands: List[str], date_cands: List[str],
@@ -216,7 +222,8 @@ def _normalize_ledger(df: pd.DataFrame, amount_cands: List[str], date_cands: Lis
     elif auto_date:
         guess=_guess_date_column(df)
         if guess:
-            df[guess]=pd.to_datetime(df[guess], errors="coerce"); info["date_col"]=guess; info["date_auto"]=True
+            df[guess]=df[guess].apply(_parse_date)  # << use dayfirst-aware parser here too
+            info["date_col"]=guess; info["date_auto"]=True
 
     df["_SIGNED_"]=signed
     df["_CREDIT_"]=df[info["credit_col"]] if info["credit_col"] in df.columns else np.nan
@@ -275,6 +282,8 @@ if run_btn:
 
     repo: Dict[str, Dict[str, Tuple[pd.DataFrame,str]]] = {}
     diag=[]
+    detected_banks=set()
+
     for (fname,fbytes) in files:
         try: sheets=_read_all_sheets(fbytes, fname)
         except Exception as e:
@@ -284,6 +293,7 @@ if run_btn:
             df_norm, info = _normalize_ledger(df.copy(), amt_cands, date_cands,
                                               enable_debit_credit=True, auto_date=auto_detect_date)
             bank_code=_detect_bank(fname, sname, df)
+            detected_banks.add(bank_code)
             repo[fname][sname]=(df_norm, bank_code)
             diag.append({"File":fname,"Sheet":sname,"Bank":bank_code,
                          "Amount Col":info.get("amt_col") or info.get("credit_col") or info.get("debit_col"),
@@ -291,6 +301,7 @@ if run_btn:
                          "Net Logic":"Yes" if info.get("net_logic") else "No",
                          "Amount rows": int(df_norm["_SIGNED_"].notna().sum()),
                          "Date rows": int(df_norm["_DATE_"].notna().sum())})
+
     with st.expander("Diagnostics", expanded=False):
         if diag: st.dataframe(pd.DataFrame(diag), use_container_width=True)
         else: st.info("No sheets parsed.")
@@ -305,7 +316,7 @@ if run_btn:
                 if d.empty or d["_DATE_"].isna().all(): continue
                 series=d["_SIGNED_"]
 
-                # Build masks safely (no precedence bugs)
+                # Build masks safely
                 m1 = (series - amt).abs() <= tol
                 m2 = (series + amt).abs() <= tol
                 m3 = (d["_CREDIT_"].fillna(0) - amt).abs() <= tol
@@ -326,24 +337,36 @@ if run_btn:
                     m.insert(5,"Input Row", int(idx)+1)
                     matched_rows.append(m)
 
-    if not matched_rows:
-        st.warning("No matches found."); st.stop()
+    all_matches = pd.concat(matched_rows, ignore_index=True).drop_duplicates() if matched_rows else pd.DataFrame()
 
-    all_matches=pd.concat(matched_rows, ignore_index=True).drop_duplicates()
-
-    # Export by bank
+    # -------- Export by bank (always make a sheet per detected bank) --------
     out=io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         if include_overview:
-            ov=(all_matches.groupby(["Bank (Detected)","Input Row"], as_index=False)
-                .size().rename(columns={"size":"Matches"}))
+            if not all_matches.empty:
+                ov=(all_matches.groupby(["Bank (Detected)","Input Row"], as_index=False)
+                    .size().rename(columns={"size":"Matches"}))
+            else:
+                ov=pd.DataFrame(columns=["Bank (Detected)","Input Row","Matches"])
             ov.to_excel(writer, index=False, sheet_name="All_Matches")
-        for bank, dfb in all_matches.groupby("Bank (Detected)"):
+
+        # Write a sheet for every bank we detected in uploads,
+        # even when there are zero matches for that bank.
+        for bank in sorted(detected_banks):
             sheet=(bank or "OTHER")[:31]
-            dfb.to_excel(writer, index=False, sheet_name=sheet)
+            if not all_matches.empty and bank in all_matches["Bank (Detected)"].unique():
+                dfb=all_matches[all_matches["Bank (Detected)"]==bank]
+                dfb.to_excel(writer, index=False, sheet_name=sheet)
+            else:
+                pd.DataFrame([{"Note":"No matches found (after filters)"}]).to_excel(writer, index=False, sheet_name=sheet)
+
     out.seek(0)
 
-    st.success(f"Saved {len(all_matches):,} rows into {all_matches['Bank (Detected)'].nunique():,} bank sheet(s).")
+    # Small summary
+    bank_count = len(detected_banks)
+    match_rows = 0 if all_matches.empty else len(all_matches)
+    st.success(f"Detected {bank_count} bank file(s). Wrote {match_rows} matched row(s).")
+
     st.download_button(
         "⬇️ Download Excel (sheets by bank)",
         data=out.getvalue(),
