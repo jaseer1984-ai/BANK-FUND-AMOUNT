@@ -19,7 +19,7 @@ st.set_page_config(page_title="Amount + Date Finder", page_icon="🔎", layout="
 # ----------------------- Bank aliases (for sheet names) -----------------------
 BANK_ALIASES: Dict[str, List[str]] = {
     "SNB":  ["SNB","NCB","Saudi National","Saudi National Bank","National Commercial","ALAHLI","AL AHLI","AHLI","AL-AHLI","الاهلي","الأهلي"],
-    "SABB": ["SABB","AWWAL","HSBC","الأول","ساب"],
+    "SBB":  ["SBB","AWWAL","HSBC","الأول","ساب"],
     "ARB":  ["ARB","AL RAJHI","ALRAJHI","RAJHI","AL-RAJHI","الراجحي","مصرف الراجحي"],
     "BSF":  ["BSF","SAUDI FRANSI","FRANSI","البنك السعودي الفرنسي","فرنسي"],
     "RIB":  ["RIB","RIYAD","RIYAD BANK","RIYADH BANK","RIYADBANK","بنك الرياض","الرياض"],
@@ -429,3 +429,4 @@ if run_btn:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
+
