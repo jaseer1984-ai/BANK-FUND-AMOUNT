@@ -1,7 +1,7 @@
-# app.py — Find-by Amount & Date (no BANK column)
-# Input Excel: AMOUNT | DATE
-# Output: one Excel with a separate sheet per input row containing all matches (date >= input date AND amount match).
-# Works with: streamlit==1.28.0, pandas==2.0.3, numpy==1.24.3, openpyxl==3.1.2, xlrd==2.0.1
+# app.py — Amount + Date Finder (always checks Credit & Debit)
+# Input Excel columns: AMOUNT | DATE
+# Output: One Excel with a sheet per input row containing all matches (Date >=, Amount match).
+# Dependencies: streamlit==1.28.0, pandas==2.0.3, numpy==1.24.3, openpyxl==3.1.2, xlrd==2.0.1
 
 import io
 import re
@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Amount + Date Finder", page_icon="🔎", layout="wide")
 
-# ----------------------- heuristics & aliases -----------------------
+# ----------------------- Heuristics -----------------------
 
 MONEY_TOKENS = [
     "amount", "credit", "debit", "value", "sar", "balance",
@@ -163,7 +163,7 @@ def _normalize_ledger(df: pd.DataFrame, amount_cands: List[str], date_cands: Lis
 
     amt_col = _first_present(df, amount_cands)
 
-    # BSF patterns
+    # BSF patterns like "Credit (SAR)" / "Debit (SAR)"
     credit_sar = _find_col_regex(df, [r"\bcredit\s*\(sar\)\b", r"\bcredit\s*\(s\.?a\.?r\.?\)\b"])
     debit_sar  = _find_col_regex(df,  [r"\bdebit\s*\(sar\)\b",  r"\bdebit\s*\(s\.?a\.?r\.?\)\b"])
 
@@ -252,7 +252,7 @@ with c3:
 
 c4,c5 = st.columns([1,1])
 with c4:
-    use_abs = st.checkbox("Match by absolute amount", value=False)  # handles sign differences
+    use_abs = st.checkbox("Match by absolute amount", value=False)
 with c5:
     auto_detect_date = st.checkbox("Auto-detect Date column if not found", value=True)
 
@@ -338,6 +338,7 @@ if run_btn:
         else:
             st.info("No sheets parsed.")
 
+    # Search
     tol = 0.0 if exact_amount else 0.01
     per_input_matches: Dict[int, pd.DataFrame] = {}
     summary_rows = []
@@ -352,12 +353,20 @@ if run_btn:
                 for sname, d in repo[fname].items():
                     if d.empty or d["_DATE_"].isna().all():
                         continue
+
                     series_amt = d["_SIGNED_"]
-                    if use_abs:
-                        series_amt = series_amt.abs()
-                    mask_amt  = (series_amt == amt_in) if tol == 0.0 else (series_amt - amt_in).abs() <= tol
+
+                    # ALWAYS consider both sides + explicit credit/debit
+                    mask_signed_pos = (series_amt -  amt_in).abs() <= tol
+                    mask_signed_neg = (series_amt +  amt_in).abs() <= tol   # catches -amount
+                    mask_credit     = (d["_CREDIT_"].fillna(0) - amt_in).abs() <= tol
+                    mask_debit      = (d["_DEBIT_"].fillna(0)  - amt_in).abs() <= tol
+                    mask_abs        = (series_amt.abs() - amt_in).abs() <= tol if use_abs else False
+
+                    mask_amt  = mask_signed_pos | mask_signed_neg | mask_credit | mask_debit | mask_abs
                     mask_date = d["_DATE_"] >= d0
                     mask = mask_amt & mask_date
+
                     if mask.any():
                         m = d.loc[mask].copy()
                         m.insert(0, "Source File", fname)
@@ -383,7 +392,6 @@ if run_btn:
 
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
-    # If nothing found at all
     if all(df.empty for df in per_input_matches.values()):
         st.warning("No matches found for any input rows.")
         st.stop()
@@ -395,14 +403,13 @@ if run_btn:
             sheet_title = f"Row{idx+1}_Amt_{str(df_in.loc[idx, '_AMOUNT']).replace('.', '_')}"
             sheet_title = sheet_title[:31].translate(str.maketrans({":":"-","/":"-","\\":"-","*":"-","?":"-","[":"(","]":")"}))
             if dfm.empty:
-                # write a small note sheet so you still see the row
                 pd.DataFrame([{"Note":"No matches"}]).to_excel(writer, index=False, sheet_name=sheet_title)
             else:
                 dfm.drop_duplicates().to_excel(writer, index=False, sheet_name=sheet_title)
     out.seek(0)
 
     st.download_button(
-        "⬇️ Download Matches (Excel: one sheet per input row)",
+        "⬇️ Download Matches (Excel: sheet per input row)",
         data=out.getvalue(),
         file_name=f"AmountDate_Matches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
