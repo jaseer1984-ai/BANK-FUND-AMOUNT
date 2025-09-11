@@ -25,6 +25,7 @@ BANK_ALIASES: Dict[str, List[str]] = {
     "RIB":  ["RIB","RIYAD","RIYAD BANK","RIYADH BANK","RIYADBANK","بنك الرياض","الرياض"],
     "INMA": ["INMA","ALINMA","AL INMA","AL-INMA","INMAA","مصرف الإنماء","الإنماء","الانماء"],
     "ANB":  ["ANB","Arab National Bank","العربي","البنك العربي الوطني"],
+    "SIB":  ["SIB","SAIB","Saudi Investment Bank","The Saudi Investment Bank","البنك السعودي للاستثمار","السعودي للاستثمار"],
 }
 
 def _detect_bank_from_filename(filename: str) -> str:
@@ -429,4 +430,5 @@ if run_btn:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
+
 
