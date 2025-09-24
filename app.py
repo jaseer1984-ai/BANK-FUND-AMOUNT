@@ -1,376 +1,390 @@
-# Amount + Date Finder — grouped by BANK (SIB/SAIB supported), Hijri avoided, day-first dates,
-# and a sheet is always created per detected bank (even with 0 matches).
-# Requirements:
-# streamlit==1.28.0
-# pandas==2.0.3
-# numpy==1.24.3
-# openpyxl==3.1.2
-# xlrd==2.0.1
+# app.py — Google Drive Amount Search + Inter-bank Pairing
+# --------------------------------------------------------
+# pip install streamlit pandas numpy openpyxl pydrive2 python-dateutil
 
-import io, re, zipfile, hashlib
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
-
-import numpy as np
+from __future__ import annotations
+import os, io, re, tempfile
+from datetime import timedelta, date
+from typing import List, Tuple
 import pandas as pd
+import numpy as np
 import streamlit as st
 
-st.set_page_config(page_title="Amount + Date Finder", page_icon="🔎", layout="wide")
+# Optional Google Drive loader (service account)
+try:
+    from pydrive2.auth import ServiceAccountCredentials
+    from pydrive2.drive import GoogleDrive
+    HAS_PYDRIVE2 = True
+except Exception:
+    HAS_PYDRIVE2 = False
 
-# --------- Bank aliases (includes SIB/SAIB) ----------
-BANK_ALIASES: Dict[str, List[str]] = {
-    "SNB":  ["SNB","NCB","Saudi National","Saudi National Bank","National Commercial","ALAHLI","AL AHLI","AHLI","AL-AHLI","الاهلي","الأهلي"],
-    "SBB":  ["SBB","AWWAL","HSBC","الأول","ساب"],
-    "ARB":  ["ARB","AL RAJHI","ALRAJHI","RAJHI","AL-RAJHI","الراجحي","مصرف الراجحي"],
-    "BSF":  ["BSF","SAUDI FRANSI","FRANSI","البنك السعودي الفرنسي","فرنسي"],
-    "RIB":  ["RIB","RIYAD","RIYAD BANK","RIYADH BANK","RIYADBANK","بنك الرياض","الرياض"],
-    "INMA": ["INMA","ALINMA","AL INMA","AL-INMA","INMAA","مصرف الإنماء","الإنماء","الانماء"],
-    "ANB":  ["ANB","Arab National Bank","العربي","البنك العربي الوطني"],
-    "SIB":  ["SIB","SAIB","Saudi Investment Bank","The Saudi Investment Bank","البنك السعودي للاستثمار","السعودي للاستثمار"],
+st.set_page_config(page_title="Drive Amount Search", layout="wide")
+st.title("🔎 Google Drive — Amount Search (Bank Statements)")
+
+# ---------------- Config ----------------
+DATE_WINDOW_DAYS = 3        # for debit↔credit pairing window
+AMOUNT_TOLERANCE = 0.05     # SAR tolerance for amount match
+
+# Column aliases (lowercased)
+HEADER_MAP = {
+    "date":     ["value date","transaction date","trans: date","date","posted","posting date","processing date"],
+    "narr":     ["details","description","transaction description","transaction details","remarks",
+                 "narration","narration 1","narration 2","narration 3","narrative","narrative 1","narrative 2","narrative 3"],
+    "debit":    ["debit","debit amount","amount dr.","debit (sar)","withdrawal","dr","amount dr"],
+    "credit":   ["credit","credit amount","amount cr.","credit (sar)","deposit","cr","amount cr"],
+    "amount":   ["amount","txn amount"],
+    "balance":  ["balance","running balance","balance (sar)"],
+    "account":  ["account","account no","iban"],
+    "ref":      ["reference","reference no","reference number","customer reference","txt id","trace","utr","customer reference #"],
+    "bank":     ["bank"],
 }
 
-def _detect_bank(filename: str, sheetname: str, df: pd.DataFrame) -> str:
-    """Detect bank from file/sheet names, headers, or the top cells."""
-    def hit(s: str) -> Optional[str]:
-        s = (s or "").lower()
-        for code, aliases in BANK_ALIASES.items():
-            for a in aliases:
-                if a.lower() in s:
-                    return code
-        return None
+# Banks we frequently see (used for dropdowns — will also auto-learn from data)
+KNOWN_BANKS = ["SNB", "SABB/BSF", "ARB", "ANB", "RIB", "SIB", "NBK", "BAB", "INM"]
 
-    for s in (filename, sheetname):
-        code = hit(s)
-        if code:
-            return code
-    code = hit(" ".join(map(str, df.columns)))
-    if code:
-        return code
-    top = " ".join(df.head(20).astype(str).fillna("").values.ravel().tolist())
-    return hit(top) or "OTHER"
+def detect_bank_from_name(name: str) -> str:
+    n = name.lower()
+    if "snb" in n or "ncb" in n: return "SNB"
+    if "sabb" in n or "bsf" in n: return "SABB/BSF"
+    if "arb" in n or "rajhi" in n: return "ARB"
+    if "anb" in n: return "ANB"
+    if "rib" in n: return "RIB"
+    if "sib" in n: return "SIB"
+    if "nbk" in n: return "NBK"
+    if "bab" in n: return "BAB"
+    if "inm" in n: return "INM"
+    return os.path.splitext(name)[0].upper()
 
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    cols = [c.lower().strip() for c in df.columns]
+    for c in candidates:
+        if c in cols:
+            return df.columns[cols.index(c)]
+    return None
 
-# ---------------- Parsing helpers ----------------
-MONEY_TOKENS = ["amount","credit","debit","value","sar","balance","رصيد","مبلغ","مدين","دائن","قيمة","ائتمان"]
-DATE_TOKENS  = ["date","value date","posting","transaction","txn","val","تاريخ","تاريخ العملية","تاريخ المعاملة"]
+def read_any_excel_or_csv(content: bytes, name: str) -> pd.DataFrame:
+    if name.lower().endswith(".csv"):
+        try:
+            return pd.read_csv(io.BytesIO(content))
+        except Exception:
+            return pd.read_csv(io.BytesIO(content), sep=";")
+    else:
+        return pd.read_excel(io.BytesIO(content))
 
-CURRENCY_RE = re.compile(r"[^\d\.\-]", re.UNICODE)
-ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
-_SLASH_DATE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
+@st.cache_data(show_spinner=False)
+def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
+    c_date = pick_col(raw, HEADER_MAP["date"]) or raw.columns[0]
+    c_narr = pick_col(raw, HEADER_MAP["narr"]) or raw.columns[min(1, len(raw.columns)-1)]
+    c_deb  = pick_col(raw, HEADER_MAP["debit"])
+    c_cred = pick_col(raw, HEADER_MAP["credit"])
+    c_amt  = pick_col(raw, HEADER_MAP["amount"])
+    c_bal  = pick_col(raw, HEADER_MAP["balance"]) or None
+    c_acct = pick_col(raw, HEADER_MAP["account"]) or None
+    c_ref  = pick_col(raw, HEADER_MAP["ref"]) or None
+    c_bank = pick_col(raw, HEADER_MAP["bank"]) or None
 
-def _clean_amount(x) -> Optional[float]:
-    """Arabic digits, trailing +/- sign, parentheses negatives, currency junk."""
-    if x is None or (isinstance(x, float) and np.isnan(x)): return None
-    s = str(x).strip()
-    if s == "": return None
-    s = s.translate(ARABIC_DIGITS)
-    s = s.replace("\u200f","").replace("\u200e","").replace("\u202a","").replace("\u202b","").replace("\u202c","")
-    s = s.replace("SAR","").replace("ر.س","").replace("ريال","").replace("﷼","").replace(" ","")
-    neg = False
-    if s.startswith("(") and s.endswith(")"): neg, s = True, s[1:-1]
-    if len(s) > 1 and s[-1] in "+-":
-        if s[-1] == "-": neg = not neg if s.startswith("-") else True
-        s = s[:-1]
-    s = s.replace(",", "")
-    s = CURRENCY_RE.sub("", s)
-    if s.count("-") > 1: s = "-" + s.replace("-", "")
-    if "-" in s and not s.startswith("-"): s = "-" + s.replace("-", "")
-    try:
-        v = float(s);  v = -v if neg else v
-        return round(v, 2)
-    except Exception:
-        return None
+    df = pd.DataFrame()
+    df["date"] = pd.to_datetime(raw[c_date], errors="coerce").dt.date
+    df["narration"] = raw[c_narr].astype(str).str.strip() if c_narr else ""
 
-def _parse_date(v) -> Optional[pd.Timestamp]:
-    """Parse date; treat slash dates day-first (10/9/2025 => 10-Sep-2025)."""
-    if pd.isna(v) or str(v).strip() == "": return None
-    s = str(v).strip()
-    if _SLASH_DATE_RE.match(s):
-        return pd.to_datetime(s, errors="coerce", dayfirst=True)
-    return pd.to_datetime(v, errors="coerce")
+    debit  = pd.to_numeric(raw[c_deb], errors="coerce") if c_deb else None
+    credit = pd.to_numeric(raw[c_cred], errors="coerce") if c_cred else None
 
-def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy(); df.columns = [str(c).strip() for c in df.columns]; return df
+    if c_amt:
+        amt = pd.to_numeric(raw[c_amt], errors="coerce")
+        if debit is None and credit is None:
+            df["amount"] = amt
+        else:
+            df["amount"] = (credit.fillna(0) if credit is not None else 0) - (debit.fillna(0) if debit is not None else 0)
+    else:
+        if debit is not None or credit is not None:
+            df["amount"] = (credit.fillna(0) if credit is not None else 0) - (debit.fillna(0) if debit is not None else 0)
+        else:
+            df["amount"] = pd.NA
 
-def _read_all_sheets(file_like: bytes, filename: str) -> Dict[str, pd.DataFrame]:
-    ext = filename.lower().rsplit(".", 1)[-1]
-    engine = "openpyxl" if ext == "xlsx" else ("xlrd" if ext == "xls" else None)
-    xls = pd.ExcelFile(io.BytesIO(file_like), engine=engine)
-    return {s: _norm_cols(xls.parse(s, dtype=object)) for s in xls.sheet_names}
+    df["balance"] = pd.to_numeric(raw[c_bal], errors="coerce") if c_bal else pd.NA
+    df["account"] = raw[c_acct].astype(str).str.strip() if c_acct else ""
+    df["ref"] = raw[c_ref].astype(str).str.strip() if c_ref else ""
 
-def _extract_files_from_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
-    out = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        for zi in zf.infolist():
-            name = zi.filename
-            if name.endswith("/") or name.startswith("__MACOSX"): continue
-            if name.lower().endswith((".xlsx",".xls")): out.append((name.split("/")[-1], zf.read(zi)))
+    if c_bank:
+        df["bank"] = raw[c_bank].astype(str).str.strip()
+    else:
+        df["bank"] = detect_bank_from_name(filename_hint)
+
+    df = df.dropna(subset=["date"]).copy()
+    df = df[~df["amount"].isna()].copy()
+    df["amount"] = df["amount"].astype(float)
+    df["direction"] = np.where(df["amount"] < 0, "FROM (OUT)", "TO (IN)")
+    df["abs_amount"] = df["amount"].abs().round(2)
+
+    # clean refs/narration
+    df["ref"] = df["ref"].str.replace("\n", " ").str.replace("\r", " ")
+    df["narration"] = df["narration"].str.replace("\n", " ").str.replace("\r", " ")
+
+    return df[["date","bank","account","narration","ref","amount","abs_amount","balance","direction"]]
+
+def drive_list_and_download(sa_json: bytes, folder_id: str) -> List[Tuple[bytes,str]]:
+    if not HAS_PYDRIVE2:
+        st.error("pydrive2 not installed. Run: pip install pydrive2")
+        return []
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    tmp.write(sa_json)
+    tmp.flush()
+
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        tmp.name,
+        scopes=['https://www.googleapis.com/auth/drive.readonly']
+    )
+    drive = GoogleDrive(creds)
+    q = f"'{folder_id}' in parents and trashed=false"
+    file_list = drive.ListFile({'q': q}).GetList()
+
+    out: List[Tuple[bytes,str]] = []
+    for f in file_list:
+        name = f.get('title') or f.get('name')
+        if not name.lower().endswith((".xlsx",".xls",".csv")):
+            continue
+        try:
+            content = f.GetContentBinary()
+            out.append((content, name))
+        except Exception as e:
+            st.warning(f"Failed to download {name}: {e}")
     return out
 
-def _bytes_from_uploader(uploaded_files) -> List[Tuple[str, bytes]]:
-    collected=[]
-    for uf in uploaded_files or []:
-        name, data = uf.name, uf.read()
-        if name.lower().endswith(".zip"): collected.extend(_extract_files_from_zip(data))
-        else: collected.append((name, data))
-    collected=[(n,b) for (n,b) in collected if n.lower().endswith((".xlsx",".xls"))]
-    seen=set(); uniq=[]
-    for (n,b) in collected:
-        key=(n.lower(), hashlib.md5(b).hexdigest())
-        if key in seen: continue
-        seen.add(key); uniq.append((n,b))
-    return uniq
-
-def _first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    lower={c.lower():c for c in df.columns}
-    for cand in candidates:
-        k=cand.strip().lower()
-        if k in lower: return lower[k]
-    return None
-
-def _find_col_regex(df: pd.DataFrame, patterns: List[str]) -> Optional[str]:
-    for col in df.columns:
-        lc=str(col).lower()
-        for pat in patterns:
-            if re.search(pat, lc): return col
-    return None
-
-def _guess_date_column(df: pd.DataFrame) -> Optional[str]:
-    """Prefer Gregorian columns and penalize Hijri-named ones."""
-    best_col, best_score = None, -1e9
-    total=len(df)
-    for c in df.columns:
-        name=str(c).lower()
-        bias = -0.5 if ("hijri" in name or "hijrah" in name) else 0.0
-        ser = df[c].apply(_parse_date)  # << use our dayfirst-aware parser
-        valid=ser.notna().sum()
-        if valid==0: continue
-        yrs=ser.dt.year.dropna()
-        within=((yrs>=2000)&(yrs<=2035)).mean() if len(yrs) else 0
-        name_bonus=0.6 if "value date" in name else (0.4 if ("posted" in name or "posting" in name) else 0.0)
-        score=valid/max(total,1) + 2.0*within + name_bonus + bias
-        if score>best_score:
-            best_col, best_score=c, score
-    return best_col
-
-def _guess_amount_column(df: pd.DataFrame) -> Optional[str]:
-    if df is None or df.empty: return None
-    best_col, best_score=None, -1.0
-    for c in df.columns:
-        lc=str(c).lower()
-        if not any(tok in lc for tok in ["amount","credit","debit","balance","الرصيد","مبلغ","مدين","دائن"]): 
-            continue
-        cleaned=df[c].apply(_clean_amount)
-        valid=cleaned.notna().sum()
-        if valid>best_score:
-            best_col, best_score=c, valid
-    return best_col
-
-def _normalize_ledger(df: pd.DataFrame, amount_cands: List[str], date_cands: List[str],
-                      enable_debit_credit=True, auto_date=True):
-    """Return df with _DATE_, _SIGNED_, _CREDIT_, _DEBIT_ + info dict."""
-    info={"amt_col":None,"date_col":None,"credit_col":None,"debit_col":None,
-          "net_logic":False,"amt_auto":False,"date_auto":False}
-    if df.empty:
-        df["_SIGNED_"]=np.nan; df["_DATE_"]=pd.NaT; df["_CREDIT_"]=np.nan; df["_DEBIT_"]=np.nan
-        return df, info
-
-    amt_col=_first_present(df, amount_cands)
-
-    credit_sar=_find_col_regex(df,[r"\bcredit\s*\(sar\)\b", r"\bcredit\s*\(s\.?a\.?r\.?\)\b"])
-    debit_sar =_find_col_regex(df,[ r"\bdebit\s*\(sar\)\b",  r"\bdebit\s*\(s\.?a\.?r\.?\)\b"])
-
-    credit_col=debit_col=None
-    if enable_debit_credit:
-        if credit_sar and debit_sar:
-            credit_col, debit_col = credit_sar, debit_sar
-        else:
-            debit_col  = _first_present(df, ["debit","dr","debit amount","مدين"])
-            credit_col = _first_present(df, ["credit","cr","credit amount","دائن"])
-            if debit_col is None:
-                for c in df.columns:
-                    lc=str(c).lower()
-                    if "debit" in lc or "مدين" in lc: debit_col=c; break
-            if credit_col is None:
-                for c in df.columns:
-                    lc=str(c).lower()
-                    if "credit" in lc or "دائن" in lc: credit_col=c; break
-
-    if credit_col: df[credit_col]=df[credit_col].apply(_clean_amount)
-    if debit_col:  df[debit_col] =df[debit_col] .apply(_clean_amount)
-
-    if credit_col and debit_col:
-        info["credit_col"], info["debit_col"], info["net_logic"]=credit_col, debit_col, True
-        signed=(df[credit_col].fillna(0)-df[debit_col].fillna(0)).round(2)
-    else:
-        if amt_col is None:
-            for c in df.columns:
-                lc=str(c).lower()
-                if any(tok in lc for tok in ["amount","credit amount","debit amount","balance","balance (sar)","المبلغ","الرصيد"]): amt_col=c; break
-        if amt_col is None:
-            guess=_guess_amount_column(df)
-            if guess: amt_col, info["amt_auto"]=guess, True
-        if amt_col:
-            df[amt_col]=df[amt_col].apply(_clean_amount); info["amt_col"]=amt_col
-            signed=df[amt_col]
-        else:
-            signed=pd.Series([np.nan]*len(df))
-
-    date_col=_first_present(df, date_cands)
-    if date_col:
-        df[date_col]=df[date_col].apply(_parse_date); info["date_col"]=date_col
-    elif auto_date:
-        guess=_guess_date_column(df)
-        if guess:
-            df[guess]=df[guess].apply(_parse_date)  # << use dayfirst-aware parser here too
-            info["date_col"]=guess; info["date_auto"]=True
-
-    df["_SIGNED_"]=signed
-    df["_CREDIT_"]=df[info["credit_col"]] if info["credit_col"] in df.columns else np.nan
-    df["_DEBIT_"] =df[info["debit_col"]]  if info["debit_col"]  in df.columns else np.nan
-    df["_DATE_"]  =df[info["date_col"]]   if info["date_col"]   in df.columns else pd.NaT
-    return df, info
-
-# ---------------- UI ----------------
-st.markdown("<h2 style='margin:0'>Amount + Date Finder</h2>", unsafe_allow_html=True)
-c0a,c0b=st.columns([1,1])
-with c0a: input_file=st.file_uploader("Input (AMOUNT, DATE)", type=["xlsx","xls"])
-with c0b: stmt_files=st.file_uploader("Statements (xlsx/xls or ZIP)", type=["xlsx","xls","zip"], accept_multiple_files=True)
-
-st.divider()
-c1,c2,c3=st.columns([1,1,1])
-with c1:
-    amount_candidates_text=st.text_input("Amount column candidates",
-        value="Amount, Credit, Credit Amount, Credit (SAR), CR, Debit, Debit Amount, Debit (SAR), DR, Value, Value Amount, Balance, Balance (SAR), الرصيد, المبلغ, مدين, دائن")
-with c2:
-    date_candidates_text=st.text_input("Date column candidates",
-        value="Value Date, Posted, Date, Transaction Date, Posting Date, تاريخ, تاريخ العملية, تاريخ المعاملة")
-with c3:
-    exact_amount=st.checkbox("Exact amount (2 decimals)", value=True)
-c4,c5=st.columns([1,1])
-with c4: use_abs=st.checkbox("Match by absolute amount", value=False)
-with c5: auto_detect_date=st.checkbox("Auto-detect Date column if not found", value=True)
-include_overview=st.checkbox("Include 'All_Matches' overview sheet", value=True)
-
-run_btn=st.button("🔎 Find", type="primary", use_container_width=True)
-
-# ---------------- Main ----------------
-if run_btn:
-    if not input_file: st.error("Upload the Input Excel."); st.stop()
-    if not stmt_files: st.error("Upload statements (or a ZIP)."); st.stop()
-
+def parse_amount(text: str) -> float | None:
+    # handle 1,000,000 and Arabic thousands sep
+    s = text.strip().replace(",", " ").replace("\u066c", " ")
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return None
     try:
-        df_in=pd.read_excel(input_file, dtype=object); df_in=_norm_cols(df_in)
-    except Exception as e:
-        st.error(f"Failed to read Input: {e}"); st.stop()
+        return float(s)
+    except Exception:
+        m = re.search(r"([0-9][0-9,]*)\.?([0-9]{0,2})", s)
+        if not m: return None
+        num = m.group(1).replace(",", "")
+        dec = m.group(2) or ""
+        return float(f"{num}.{dec}" if dec else num)
 
-    m={c.lower():c for c in df_in.columns}
-    c_amt_in, c_date_in = m.get("amount"), m.get("date")
-    if not (c_amt_in and c_date_in):
-        st.error("Input must have columns: AMOUNT and DATE."); st.stop()
+def pair_debit_credit(df: pd.DataFrame,
+                      date_from: date | None,
+                      date_to: date | None,
+                      from_bank_hint: str | None,
+                      to_bank_hint: str | None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    outs = df[df["amount"] < 0].copy()  # FROM
+    ins  = df[df["amount"] > 0].copy()  # TO
 
-    df_in["_AMOUNT"]=df_in[c_amt_in].apply(_clean_amount)
-    df_in["_DATE"]  =df_in[c_date_in].apply(_parse_date)
-    df_in=df_in.dropna(subset=["_AMOUNT","_DATE"])
-    if df_in.empty: st.error("No valid rows after cleaning."); st.stop()
+    # apply bank hints (optional)
+    if from_bank_hint:
+        outs = outs[outs["bank"].str.upper() == from_bank_hint.upper()]
+    if to_bank_hint:
+        ins = ins[ins["bank"].str.upper() == to_bank_hint.upper()]
 
-    files=_bytes_from_uploader(stmt_files)
-    if not files: st.error("No readable Excel files found."); st.stop()
+    # apply date filters to speed matching
+    if date_from:
+        outs = outs[outs["date"] >= date_from]
+        ins  = ins[ins["date"]  >= date_from]
+    if date_to:
+        outs = outs[outs["date"] <= date_to]
+        ins  = ins[ins["date"]  <= date_to]
 
-    amt_cands=[s.strip() for s in amount_candidates_text.split(",") if s.strip()]
-    date_cands=[s.strip() for s in date_candidates_text.split(",") if s.strip()]
+    matches = []
+    used_in = set()
+    for i, o in outs.iterrows():
+        cand = ins[(np.abs(ins["abs_amount"] - o["abs_amount"]) <= AMOUNT_TOLERANCE)]
+        if date_from or date_to:
+            # keep inside global filters but also ±window around each OUT for robustness
+            pass
+        # ± window around OUT date
+        cand = cand[(pd.to_datetime(cand["date"]) >= pd.to_datetime(o["date"]) - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
+                    (pd.to_datetime(cand["date"]) <= pd.to_datetime(o["date"]) + pd.Timedelta(days=DATE_WINDOW_DAYS))]
+        cand = cand[~cand.index.isin(used_in)]
+        if cand.empty:
+            continue
+        # pick closest by date
+        cand = cand.assign(score=(pd.to_datetime(cand["date"]) - pd.to_datetime(o["date"])).abs().dt.days)
+        m = cand.sort_values("score").iloc[0]
+        used_in.add(m.name)
+        matches.append({
+            "date_from": o["date"],
+            "bank_from": o["bank"],
+            "acct_from": o["account"],
+            "ref_from":  o["ref"],
+            "narr_from": o["narration"],
+            "amt_from":  o["amount"],
+            "date_to":   m["date"],
+            "bank_to":   m["bank"],
+            "acct_to":   m["account"],
+            "ref_to":    m["ref"],
+            "narr_to":   m["narration"],
+            "amt_to":    m["amount"],
+            "abs_amount": o["abs_amount"],
+            "lag_days":   int(abs(pd.to_datetime(m["date"]) - pd.to_datetime(o["date"])).days),
+        })
+    return pd.DataFrame(matches)
 
-    repo: Dict[str, Dict[str, Tuple[pd.DataFrame,str]]] = {}
-    diag=[]
-    detected_banks=set()
-
-    for (fname,fbytes) in files:
-        try: sheets=_read_all_sheets(fbytes, fname)
-        except Exception as e:
-            st.warning(f"Skipped {fname}: {e}"); continue
-        repo[fname]={}
-        for sname, df in sheets.items():
-            df_norm, info = _normalize_ledger(df.copy(), amt_cands, date_cands,
-                                              enable_debit_credit=True, auto_date=auto_detect_date)
-            bank_code=_detect_bank(fname, sname, df)
-            detected_banks.add(bank_code)
-            repo[fname][sname]=(df_norm, bank_code)
-            diag.append({"File":fname,"Sheet":sname,"Bank":bank_code,
-                         "Amount Col":info.get("amt_col") or info.get("credit_col") or info.get("debit_col"),
-                         "Date Col": (info.get("date_col") + (" (auto)" if info.get("date_auto") else "")) if info.get("date_col") else None,
-                         "Net Logic":"Yes" if info.get("net_logic") else "No",
-                         "Amount rows": int(df_norm["_SIGNED_"].notna().sum()),
-                         "Date rows": int(df_norm["_DATE_"].notna().sum())})
-
-    with st.expander("Diagnostics", expanded=False):
-        if diag: st.dataframe(pd.DataFrame(diag), use_container_width=True)
-        else: st.info("No sheets parsed.")
-
-    tol=0.0 if exact_amount else 0.01
-    matched_rows=[]
-    for idx, r in df_in.iterrows():
-        amt=float(abs(r["_AMOUNT"]) if use_abs else r["_AMOUNT"])
-        d0=r["_DATE"]
-        for fname in repo:
-            for sname,(d, bank_code) in repo[fname].items():
-                if d.empty or d["_DATE_"].isna().all(): continue
-                series=d["_SIGNED_"]
-
-                # Build masks safely
-                m1 = (series - amt).abs() <= tol
-                m2 = (series + amt).abs() <= tol
-                m3 = (d["_CREDIT_"].fillna(0) - amt).abs() <= tol
-                m4 = (d["_DEBIT_"].fillna(0)  - amt).abs() <= tol
-                m5 = (series.abs() - amt).abs() <= tol if use_abs else pd.Series(False, index=d.index)
-
-                mask_amt  = m1 | m2 | m3 | m4 | m5
-                mask_date = d["_DATE_"] >= d0
-                mask = mask_amt & mask_date
-
-                if mask.any():
-                    m=d.loc[mask].copy()
-                    m.insert(0,"Bank (Detected)", bank_code)
-                    m.insert(1,"Source File", fname)
-                    m.insert(2,"Sheet", sname)
-                    m.insert(3,"AMOUNT (Input)", amt)
-                    m.insert(4,"DATE From (Input)", pd.to_datetime(d0).date())
-                    m.insert(5,"Input Row", int(idx)+1)
-                    matched_rows.append(m)
-
-    all_matches = pd.concat(matched_rows, ignore_index=True).drop_duplicates() if matched_rows else pd.DataFrame()
-
-    # -------- Export by bank (always make a sheet per detected bank) --------
-    out=io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        if include_overview:
-            if not all_matches.empty:
-                ov=(all_matches.groupby(["Bank (Detected)","Input Row"], as_index=False)
-                    .size().rename(columns={"size":"Matches"}))
-            else:
-                ov=pd.DataFrame(columns=["Bank (Detected)","Input Row","Matches"])
-            ov.to_excel(writer, index=False, sheet_name="All_Matches")
-
-        # Write a sheet for every bank we detected in uploads,
-        # even when there are zero matches for that bank.
-        for bank in sorted(detected_banks):
-            sheet=(bank or "OTHER")[:31]
-            if not all_matches.empty and bank in all_matches["Bank (Detected)"].unique():
-                dfb=all_matches[all_matches["Bank (Detected)"]==bank]
-                dfb.to_excel(writer, index=False, sheet_name=sheet)
-            else:
-                pd.DataFrame([{"Note":"No matches found (after filters)"}]).to_excel(writer, index=False, sheet_name=sheet)
-
-    out.seek(0)
-
-    # Small summary
-    bank_count = len(detected_banks)
-    match_rows = 0 if all_matches.empty else len(all_matches)
-    st.success(f"Detected {bank_count} bank file(s). Wrote {match_rows} matched row(s).")
-
-    st.download_button(
-        "⬇️ Download Excel (sheets by bank)",
-        data=out.getvalue(),
-        file_name=f"AmountDate_ByBank_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
+def confirmation_line(row: pd.Series) -> str:
+    return (
+        f"DONE ✅ | {row['bank_from']}→{row['bank_to']} | SAR {row['abs_amount']:,.2f} "
+        f"| DR Ref: {row['ref_from'] or ''} | CR Ref: {row['ref_to'] or ''} | Lag(d): {row['lag_days']}"
     )
+
+# ---------------- Sidebar: Source Loader ----------------
+st.sidebar.header("📦 Source")
+mode = st.sidebar.radio("Choose source", ["Google Drive", "Local Folder"], index=0)
+frames: List[pd.DataFrame] = []
+
+# Persist data in session
+if "_index" not in st.session_state:
+    st.session_state._index = pd.DataFrame()
+
+if mode == "Google Drive":
+    st.sidebar.markdown("**Step 1** — Upload Service Account JSON")
+    sa_file = st.sidebar.file_uploader("Service Account JSON", type=["json"])
+    st.sidebar.markdown("**Step 2** — Paste Drive Folder ID")
+    folder_input = st.sidebar.text_input("Folder ID", value="")  # paste your ID here
+    if st.sidebar.button("Load from Drive"):
+        if not sa_file or not folder_input.strip():
+            st.error("Upload the JSON and paste Folder ID.")
+        else:
+            files = drive_list_and_download(sa_file.read(), folder_input.strip())
+            for content, name in files:
+                try:
+                    raw = read_any_excel_or_csv(content, name)
+                    norm = normalize_df(raw, name)
+                    frames.append(norm.assign(source=name))
+                except Exception as e:
+                    st.warning(f"Failed to read {name}: {e}")
+            if frames:
+                st.session_state._index = pd.concat(frames, ignore_index=True)
+                st.success(f"Loaded {len(frames)} files from Drive.")
+else:
+    folder_local = st.sidebar.text_input("Local folder path", value="")
+    if st.sidebar.button("Load local"):
+        if not folder_local or not os.path.isdir(folder_local):
+            st.error("Folder not found")
+        else:
+            for name in os.listdir(folder_local):
+                if not name.lower().endswith((".xlsx",".xls",".csv")) or name.startswith("~$"):
+                    continue
+                path = os.path.join(folder_local, name)
+                try:
+                    with open(path, "rb") as f:
+                        content = f.read()
+                    raw = read_any_excel_or_csv(content, name)
+                    norm = normalize_df(raw, name)
+                    frames.append(norm.assign(source=name))
+                except Exception as e:
+                    st.warning(f"Failed to read {name}: {e}")
+            if frames:
+                st.session_state._index = pd.concat(frames, ignore_index=True)
+                st.success(f"Loaded {len(frames)} files from local.")
+
+df_all = st.session_state._index
+
+with st.expander("Preview (first 100 rows)", expanded=False):
+    if not df_all.empty:
+        st.dataframe(df_all.head(100), use_container_width=True)
+
+# ---------------- Filters & Search ----------------
+st.subheader("Search by Amount & Filters")
+
+c1, c2, c3 = st.columns([2,1,1])
+with c1:
+    amt_str = st.text_input("Amount", value="1000000")
+with c2:
+    tol = st.number_input("Tolerance (SAR)", min_value=0.0, max_value=50.0, value=AMOUNT_TOLERANCE, step=0.05)
+with c3:
+    go = st.button("Search")
+
+c4, c5 = st.columns(2)
+with c4:
+    date_from = st.date_input("From Date", value=None)
+with c5:
+    date_to = st.date_input("To Date", value=None)
+
+# Learn bank list from data (plus known list)
+bank_list = sorted(set(df_all["bank"].dropna().astype(str))) if not df_all.empty else []
+all_banks = ["All"] + sorted(set(KNOWN_BANKS + bank_list))
+
+c6, c7 = st.columns(2)
+with c6:
+    from_bank = st.selectbox("From Bank (debit)", all_banks, index=0)
+with c7:
+    to_bank = st.selectbox("To Bank (credit)", all_banks, index=0)
+
+def apply_filters(df: pd.DataFrame,
+                  target: float,
+                  tol: float,
+                  date_from: date | None,
+                  date_to: date | None,
+                  bank_filter: str | None) -> pd.DataFrame:
+    x = df[np.abs(df["abs_amount"] - target) <= tol].copy()
+    if date_from:
+        x = x[x["date"] >= date_from]
+    if date_to:
+        x = x[x["date"] <= date_to]
+    if bank_filter and bank_filter != "All":
+        x = x[x["bank"].str.upper() == bank_filter.upper()]
+    return x
+
+if go:
+    if df_all.empty:
+        st.warning("No data loaded yet. Load from Drive or Local first.")
+    else:
+        target = parse_amount(amt_str)
+        if target is None:
+            st.error("Please enter a valid number, e.g., 1000000 or 1,000,000")
+        else:
+            # show raw hits (any bank first)
+            hits = df_all[np.abs(df_all["abs_amount"] - target) <= tol].copy()
+            if date_from:
+                hits = hits[hits["date"] >= date_from]
+            if date_to:
+                hits = hits[hits["date"] <= date_to]
+
+            # If they pick a specific From/To bank, we still show all hits,
+            # then also show the paired (FROM→TO) confirmation if available.
+            st.markdown(f"**Results for SAR {target:,.2f} ± {tol}**")
+            if hits.empty:
+                st.info("No lines found with the selected amount and date filters.")
+            else:
+                st.dataframe(
+                    hits.sort_values(["date","bank","direction"])[
+                        ["date","bank","account","narration","ref","amount","balance","direction","source"]
+                    ],
+                    use_container_width=True
+                )
+
+            # Try pairing
+            f_hint = from_bank if from_bank != "All" else None
+            t_hint = to_bank if to_bank != "All" else None
+            # Use only rows around the amount to keep pairing fast
+            data_for_pair = hits.copy()
+            pairs = pair_debit_credit(data_for_pair, date_from, date_to, f_hint, t_hint)
+
+            if not pairs.empty:
+                st.subheader("Possible transfer pairs (same amount within ± days)")
+                pairs["Confirmation"] = pairs.apply(confirmation_line, axis=1)
+                st.dataframe(
+                    pairs[["date_from","bank_from","acct_from","ref_from",
+                           "date_to","bank_to","acct_to","ref_to",
+                           "abs_amount","lag_days","Confirmation"]],
+                    use_container_width=True
+                )
+
+                # Offer Excel download
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine="openpyxl") as xw:
+                    hits.to_excel(xw, index=False, sheet_name="All Hits")
+                    pairs.to_excel(xw, index=False, sheet_name="Pairs")
+                st.download_button(
+                    "Download Excel (Hits + Pairs)",
+                    data=out.getvalue(),
+                    file_name=f"AmountSearch_{target:,.0f}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.caption("No debit↔credit pairs found in the current window. The counter-entry might post later. Try a wider date range.")
