@@ -1,6 +1,6 @@
 # app.py — Google Drive Amount Search + Inter-bank Pairing
 # --------------------------------------------------------
-# pip install streamlit pandas numpy openpyxl pydrive2 python-dateutil
+# Run: streamlit run app.py
 
 from __future__ import annotations
 import os, io, re, tempfile
@@ -10,15 +10,15 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# Optional Google Drive loader (service account)
+# ---- Google Drive (service account) ----
 try:
-    from pydrive2.auth import ServiceAccountCredentials
+    from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
     HAS_PYDRIVE2 = True
 except Exception:
     HAS_PYDRIVE2 = False
 
-st.set_page_config(page_title="Drive Amount Search", layout="wide")
+st.set_page_config(page_title="Google Drive — Amount Search", layout="wide")
 st.title("🔎 Google Drive — Amount Search (Bank Statements)")
 
 # ---------------- Config ----------------
@@ -39,7 +39,7 @@ HEADER_MAP = {
     "bank":     ["bank"],
 }
 
-# Banks we frequently see (used for dropdowns — will also auto-learn from data)
+# Banks for dropdowns (will be extended by data)
 KNOWN_BANKS = ["SNB", "SABB/BSF", "ARB", "ANB", "RIB", "SIB", "NBK", "BAB", "INM"]
 
 def detect_bank_from_name(name: str) -> str:
@@ -117,25 +117,31 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
     df["direction"] = np.where(df["amount"] < 0, "FROM (OUT)", "TO (IN)")
     df["abs_amount"] = df["amount"].abs().round(2)
 
-    # clean refs/narration
     df["ref"] = df["ref"].str.replace("\n", " ").str.replace("\r", " ")
     df["narration"] = df["narration"].str.replace("\n", " ").str.replace("\r", " ")
 
     return df[["date","bank","account","narration","ref","amount","abs_amount","balance","direction"]]
 
+# ---------- Google Drive list & download (fixed auth) ----------
 def drive_list_and_download(sa_json: bytes, folder_id: str) -> List[Tuple[bytes,str]]:
     if not HAS_PYDRIVE2:
         st.error("pydrive2 not installed. Run: pip install pydrive2")
         return []
+
+    # Write uploaded JSON to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
     tmp.write(sa_json)
     tmp.flush()
 
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        tmp.name,
-        scopes=['https://www.googleapis.com/auth/drive.readonly']
-    )
-    drive = GoogleDrive(creds)
+    # Authenticate with service account JSON
+    gauth = GoogleAuth(settings={
+        "client_config_backend": "service",
+        "service_config": {"client_json_file_path": tmp.name},
+    })
+    gauth.ServiceAuth()  # ensures gauth.service is created
+    drive = GoogleDrive(gauth)
+
+    # List files in folder
     q = f"'{folder_id}' in parents and trashed=false"
     file_list = drive.ListFile({'q': q}).GetList()
 
@@ -152,7 +158,6 @@ def drive_list_and_download(sa_json: bytes, folder_id: str) -> List[Tuple[bytes,
     return out
 
 def parse_amount(text: str) -> float | None:
-    # handle 1,000,000 and Arabic thousands sep
     s = text.strip().replace(",", " ").replace("\u066c", " ")
     s = re.sub(r"\s+", "", s)
     if not s:
@@ -176,13 +181,11 @@ def pair_debit_credit(df: pd.DataFrame,
     outs = df[df["amount"] < 0].copy()  # FROM
     ins  = df[df["amount"] > 0].copy()  # TO
 
-    # apply bank hints (optional)
     if from_bank_hint:
         outs = outs[outs["bank"].str.upper() == from_bank_hint.upper()]
     if to_bank_hint:
-        ins = ins[ins["bank"].str.upper() == to_bank_hint.upper()]
+        ins  = ins[ins["bank"].str.upper() == to_bank_hint.upper()]
 
-    # apply date filters to speed matching
     if date_from:
         outs = outs[outs["date"] >= date_from]
         ins  = ins[ins["date"]  >= date_from]
@@ -190,36 +193,22 @@ def pair_debit_credit(df: pd.DataFrame,
         outs = outs[outs["date"] <= date_to]
         ins  = ins[ins["date"]  <= date_to]
 
-    matches = []
-    used_in = set()
-    for i, o in outs.iterrows():
+    matches, used_in = [], set()
+    for _, o in outs.iterrows():
         cand = ins[(np.abs(ins["abs_amount"] - o["abs_amount"]) <= AMOUNT_TOLERANCE)]
-        if date_from or date_to:
-            # keep inside global filters but also ±window around each OUT for robustness
-            pass
-        # ± window around OUT date
         cand = cand[(pd.to_datetime(cand["date"]) >= pd.to_datetime(o["date"]) - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
                     (pd.to_datetime(cand["date"]) <= pd.to_datetime(o["date"]) + pd.Timedelta(days=DATE_WINDOW_DAYS))]
         cand = cand[~cand.index.isin(used_in)]
         if cand.empty:
             continue
-        # pick closest by date
         cand = cand.assign(score=(pd.to_datetime(cand["date"]) - pd.to_datetime(o["date"])).abs().dt.days)
         m = cand.sort_values("score").iloc[0]
         used_in.add(m.name)
         matches.append({
-            "date_from": o["date"],
-            "bank_from": o["bank"],
-            "acct_from": o["account"],
-            "ref_from":  o["ref"],
-            "narr_from": o["narration"],
-            "amt_from":  o["amount"],
-            "date_to":   m["date"],
-            "bank_to":   m["bank"],
-            "acct_to":   m["account"],
-            "ref_to":    m["ref"],
-            "narr_to":   m["narration"],
-            "amt_to":    m["amount"],
+            "date_from": o["date"], "bank_from": o["bank"], "acct_from": o["account"],
+            "ref_from":  o["ref"],  "narr_from": o["narration"], "amt_from": o["amount"],
+            "date_to":   m["date"], "bank_to":   m["bank"], "acct_to":   m["account"],
+            "ref_to":    m["ref"],  "narr_to":   m["narration"], "amt_to":   m["amount"],
             "abs_amount": o["abs_amount"],
             "lag_days":   int(abs(pd.to_datetime(m["date"]) - pd.to_datetime(o["date"])).days),
         })
@@ -236,7 +225,6 @@ st.sidebar.header("📦 Source")
 mode = st.sidebar.radio("Choose source", ["Google Drive", "Local Folder"], index=0)
 frames: List[pd.DataFrame] = []
 
-# Persist data in session
 if "_index" not in st.session_state:
     st.session_state._index = pd.DataFrame()
 
@@ -244,7 +232,7 @@ if mode == "Google Drive":
     st.sidebar.markdown("**Step 1** — Upload Service Account JSON")
     sa_file = st.sidebar.file_uploader("Service Account JSON", type=["json"])
     st.sidebar.markdown("**Step 2** — Paste Drive Folder ID")
-    folder_input = st.sidebar.text_input("Folder ID", value="")  # paste your ID here
+    folder_input = st.sidebar.text_input("Folder ID", value="")
     if st.sidebar.button("Load from Drive"):
         if not sa_file or not folder_input.strip():
             st.error("Upload the JSON and paste Folder ID.")
@@ -305,7 +293,7 @@ with c4:
 with c5:
     date_to = st.date_input("To Date", value=None)
 
-# Learn bank list from data (plus known list)
+# learn bank list from data
 bank_list = sorted(set(df_all["bank"].dropna().astype(str))) if not df_all.empty else []
 all_banks = ["All"] + sorted(set(KNOWN_BANKS + bank_list))
 
@@ -319,15 +307,12 @@ def apply_filters(df: pd.DataFrame,
                   target: float,
                   tol: float,
                   date_from: date | None,
-                  date_to: date | None,
-                  bank_filter: str | None) -> pd.DataFrame:
+                  date_to: date | None) -> pd.DataFrame:
     x = df[np.abs(df["abs_amount"] - target) <= tol].copy()
     if date_from:
         x = x[x["date"] >= date_from]
     if date_to:
         x = x[x["date"] <= date_to]
-    if bank_filter and bank_filter != "All":
-        x = x[x["bank"].str.upper() == bank_filter.upper()]
     return x
 
 if go:
@@ -338,15 +323,8 @@ if go:
         if target is None:
             st.error("Please enter a valid number, e.g., 1000000 or 1,000,000")
         else:
-            # show raw hits (any bank first)
-            hits = df_all[np.abs(df_all["abs_amount"] - target) <= tol].copy()
-            if date_from:
-                hits = hits[hits["date"] >= date_from]
-            if date_to:
-                hits = hits[hits["date"] <= date_to]
+            hits = apply_filters(df_all, target, tol, date_from, date_to)
 
-            # If they pick a specific From/To bank, we still show all hits,
-            # then also show the paired (FROM→TO) confirmation if available.
             st.markdown(f"**Results for SAR {target:,.2f} ± {tol}**")
             if hits.empty:
                 st.info("No lines found with the selected amount and date filters.")
@@ -358,12 +336,10 @@ if go:
                     use_container_width=True
                 )
 
-            # Try pairing
+            # Attempt debit↔credit pairing (respect bank hints if chosen)
             f_hint = from_bank if from_bank != "All" else None
-            t_hint = to_bank if to_bank != "All" else None
-            # Use only rows around the amount to keep pairing fast
-            data_for_pair = hits.copy()
-            pairs = pair_debit_credit(data_for_pair, date_from, date_to, f_hint, t_hint)
+            t_hint = to_bank   if to_bank   != "All" else None
+            pairs = pair_debit_credit(hits, date_from, date_to, f_hint, t_hint)
 
             if not pairs.empty:
                 st.subheader("Possible transfer pairs (same amount within ± days)")
@@ -375,7 +351,7 @@ if go:
                     use_container_width=True
                 )
 
-                # Offer Excel download
+                # Excel download
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine="openpyxl") as xw:
                     hits.to_excel(xw, index=False, sheet_name="All Hits")
@@ -383,8 +359,8 @@ if go:
                 st.download_button(
                     "Download Excel (Hits + Pairs)",
                     data=out.getvalue(),
-                    file_name=f"AmountSearch_{target:,.0f}.xlsx",
+                    file_name=f"AmountSearch_{int(round(target))}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.caption("No debit↔credit pairs found in the current window. The counter-entry might post later. Try a wider date range.")
+                st.caption("No debit↔credit pairs found. Counter-entry may post later or is in another date window.")
