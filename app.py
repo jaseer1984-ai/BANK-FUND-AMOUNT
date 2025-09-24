@@ -1,20 +1,20 @@
-# app.py — Local Folder Amount Search + Inter-bank Pairing
-# --------------------------------------------------------
+# app.py — Local Amount Search + Pairing (Folder OR Upload)
+# ---------------------------------------------------------
 # Run: streamlit run app.py
 
 from __future__ import annotations
 import os, io, re
 from datetime import date
-from typing import List, Tuple
+from typing import List
 import pandas as pd
 import numpy as np
 import streamlit as st
 
 st.set_page_config(page_title="Local — Amount Search (Bank Statements)", layout="wide")
-st.title("💾 Local Folder — Amount Search (Bank Statements)")
+st.title("💾 Local — Amount Search (Bank Statements)")
 
-# ---------------- Config ----------------
-DATE_WINDOW_DAYS = 3        # days to search around for debit↔credit pairing
+# ------------ Config ------------
+DATE_WINDOW_DAYS = 3        # ± days for pairing
 AMOUNT_TOLERANCE = 0.05     # SAR tolerance
 
 # Column aliases (lowercased)
@@ -31,20 +31,21 @@ HEADER_MAP = {
     "bank":     ["bank"],
 }
 
-# Banks for dropdowns (will be extended by data)
-KNOWN_BANKS = ["SNB", "SABB/BSF", "ARB", "ANB", "RIB", "SIB", "NBK", "BAB", "INM"]
+# Separate banks (SABB & BSF separate now)
+KNOWN_BANKS = ["SNB","SABB","BSF","ARB","ANB","RIB","SIB","NBK","BAB","INM"]
 
 def detect_bank_from_name(name: str) -> str:
     n = name.lower()
     if "snb" in n or "ncb" in n: return "SNB"
-    if "sabb" in n or "bsf" in n: return "SABB/BSF"
-    if "arb" in n or "rajhi" in n: return "ARB"
-    if "anb" in n: return "ANB"
-    if "rib" in n: return "RIB"
-    if "sib" in n: return "SIB"
-    if "nbk" in n: return "NBK"
-    if "bab" in n: return "BAB"
-    if "inm" in n: return "INM"
+    if "sabb" in n: return "SABB"
+    if "bsf"  in n: return "BSF"
+    if "arb"  in n or "rajhi" in n: return "ARB"
+    if "anb"  in n: return "ANB"
+    if "rib"  in n: return "RIB"
+    if "sib"  in n: return "SIB"
+    if "nbk"  in n: return "NBK"
+    if "bab"  in n: return "BAB"
+    if "inm"  in n: return "INM"
     return os.path.splitext(name)[0].upper()
 
 def pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
@@ -54,15 +55,21 @@ def pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
             return df.columns[cols.index(c)]
     return None
 
-def read_any_excel_or_csv(path: str) -> pd.DataFrame:
-    name = os.path.basename(path)
+def read_any_excel_or_csv_bytes(content: bytes, name: str) -> pd.DataFrame:
     if name.lower().endswith(".csv"):
+        try:
+            return pd.read_csv(io.BytesIO(content))
+        except Exception:
+            return pd.read_csv(io.BytesIO(content), sep=";")
+    return pd.read_excel(io.BytesIO(content))
+
+def read_any_excel_or_csv_path(path: str) -> pd.DataFrame:
+    if path.lower().endswith(".csv"):
         try:
             return pd.read_csv(path)
         except Exception:
             return pd.read_csv(path, sep=";")
-    else:
-        return pd.read_excel(path)
+    return pd.read_excel(path)
 
 @st.cache_data(show_spinner=False)
 def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
@@ -110,16 +117,15 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
     df["direction"] = np.where(df["amount"] < 0, "FROM (OUT)", "TO (IN)")
     df["abs_amount"] = df["amount"].abs().round(2)
 
-    df["ref"] = df["ref"].str.replace("\n", " ").str.replace("\r", " ")
-    df["narration"] = df["narration"].str.replace("\n", " ").str.replace("\r", " ")
+    df["ref"] = df["ref"].str.replace("\n"," ").str.replace("\r"," ")
+    df["narration"] = df["narration"].str.replace("\n"," ").str.replace("\r"," ")
 
     return df[["date","bank","account","narration","ref","amount","abs_amount","balance","direction"]]
 
 def parse_amount(text: str) -> float | None:
     s = text.strip().replace(",", " ").replace("\u066c", " ")
     s = re.sub(r"\s+", "", s)
-    if not s:
-        return None
+    if not s: return None
     try:
         return float(s)
     except Exception:
@@ -134,10 +140,9 @@ def pair_debit_credit(df: pd.DataFrame,
                       date_to: date | None,
                       from_bank_hint: str | None,
                       to_bank_hint: str | None) -> pd.DataFrame:
-    if df.empty:
-        return df
-    outs = df[df["amount"] < 0].copy()  # FROM
-    ins  = df[df["amount"] > 0].copy()  # TO
+    if df.empty: return df
+    outs = df[df["amount"] < 0].copy()
+    ins  = df[df["amount"] > 0].copy()
 
     if from_bank_hint:
         outs = outs[outs["bank"].str.upper() == from_bank_hint.upper()]
@@ -145,21 +150,17 @@ def pair_debit_credit(df: pd.DataFrame,
         ins  = ins[ins["bank"].str.upper() == to_bank_hint.upper()]
 
     if date_from:
-        outs = outs[outs["date"] >= date_from]
-        ins  = ins[ins["date"]  >= date_from]
+        outs = outs[outs["date"] >= date_from]; ins = ins[ins["date"] >= date_from]
     if date_to:
-        outs = outs[outs["date"] <= date_to]
-        ins  = ins[ins["date"]  <= date_to]
+        outs = outs[outs["date"] <= date_to];   ins = ins[ins["date"] <= date_to]
 
     matches, used_in = [], set()
     for _, o in outs.iterrows():
         cand = ins[(np.abs(ins["abs_amount"] - o["abs_amount"]) <= AMOUNT_TOLERANCE)]
-        # ± window around OUT date
         cand = cand[(pd.to_datetime(cand["date"]) >= pd.to_datetime(o["date"]) - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
                     (pd.to_datetime(cand["date"]) <= pd.to_datetime(o["date"]) + pd.Timedelta(days=DATE_WINDOW_DAYS))]
         cand = cand[~cand.index.isin(used_in)]
-        if cand.empty:
-            continue
+        if cand.empty: continue
         cand = cand.assign(score=(pd.to_datetime(cand["date"]) - pd.to_datetime(o["date"])).abs().dt.days)
         m = cand.sort_values("score").iloc[0]
         used_in.add(m.name)
@@ -179,39 +180,59 @@ def confirmation_line(row: pd.Series) -> str:
         f"| DR Ref: {row['ref_from'] or ''} | CR Ref: {row['ref_to'] or ''} | Lag(d): {row['lag_days']}"
     )
 
-# ---------------- Sidebar: Local Loader ----------------
+# ------------ Sidebar: Source ------------
 st.sidebar.header("📦 Source")
-st.sidebar.write("**Mode:** Local Folder (no Google Drive)")
+mode = st.sidebar.radio("Choose input method", ["Browse & Upload files", "Local Folder path"], index=0)
 
-folder_local = st.sidebar.text_input("Local folder path (e.g., D:/My Drive/BANK SOA)", value="")
-load_btn = st.sidebar.button("Load local files")
-
-# Persist data between searches
+# keep data between actions
 if "_index" not in st.session_state:
     st.session_state._index = pd.DataFrame()
 
-if load_btn:
-    frames: List[pd.DataFrame] = []
-    if not folder_local or not os.path.isdir(folder_local):
-        st.error("Folder not found. Please paste a valid local path.")
-    else:
-        names_loaded = []
-        for name in os.listdir(folder_local):
-            if name.startswith("~$"):     # skip temp Excel lock files
-                continue
-            if not name.lower().endswith((".xlsx",".xls",".csv")):
-                continue
-            path = os.path.join(folder_local, name)
-            try:
-                raw = read_any_excel_or_csv(path)
-                norm = normalize_df(raw, name)
-                frames.append(norm.assign(source=name))
-                names_loaded.append(name)
-            except Exception as e:
-                st.warning(f"Failed to read {name}: {e}")
-        if frames:
-            st.session_state._index = pd.concat(frames, ignore_index=True)
-            st.success(f"Loaded {len(frames)} files: {', '.join(names_loaded[:6])}{' …' if len(names_loaded)>6 else ''}")
+frames: List[pd.DataFrame] = []
+loaded_names: List[str] = []
+
+if mode == "Browse & Upload files":
+    uploads = st.sidebar.file_uploader(
+        "Upload one or more statement files (.xlsx, .xls, .csv)",
+        type=["xlsx","xls","csv"],
+        accept_multiple_files=True
+    )
+    if st.sidebar.button("Load uploaded files"):
+        if not uploads:
+            st.error("Please upload at least one file.")
+        else:
+            for up in uploads:
+                try:
+                    raw = read_any_excel_or_csv_bytes(up.read(), up.name)
+                    norm = normalize_df(raw, up.name)
+                    frames.append(norm.assign(source=up.name))
+                    loaded_names.append(up.name)
+                except Exception as e:
+                    st.warning(f"Failed to read {up.name}: {e}")
+            if frames:
+                st.session_state._index = pd.concat(frames, ignore_index=True)
+                st.success(f"Loaded {len(frames)} files: {', '.join(loaded_names[:6])}{' …' if len(loaded_names)>6 else ''}")
+
+else:  # Local Folder path
+    folder_local = st.sidebar.text_input("Local folder path (e.g., D:/BANK SOA)", value="")
+    if st.sidebar.button("Load local folder"):
+        if not folder_local or not os.path.isdir(folder_local):
+            st.error("Folder not found. Paste a valid local path.")
+        else:
+            for name in os.listdir(folder_local):
+                if name.startswith("~$"): continue
+                if not name.lower().endswith((".xlsx",".xls",".csv")): continue
+                path = os.path.join(folder_local, name)
+                try:
+                    raw = read_any_excel_or_csv_path(path)
+                    norm = normalize_df(raw, name)
+                    frames.append(norm.assign(source=name))
+                    loaded_names.append(name)
+                except Exception as e:
+                    st.warning(f"Failed to read {name}: {e}")
+            if frames:
+                st.session_state._index = pd.concat(frames, ignore_index=True)
+                st.success(f"Loaded {len(frames)} files: {', '.join(loaded_names[:6])}{' …' if len(loaded_names)>6 else ''}")
 
 df_all = st.session_state._index
 
@@ -219,7 +240,7 @@ with st.expander("Preview (first 100 rows)", expanded=False):
     if not df_all.empty:
         st.dataframe(df_all.head(100), use_container_width=True)
 
-# ---------------- Filters & Search ----------------
+# ------------ Filters & Search ------------
 st.subheader("Search by Amount & Filters")
 
 c1, c2, c3 = st.columns([2,1,1])
@@ -236,7 +257,7 @@ with c4:
 with c5:
     date_to = st.date_input("To Date", value=None)
 
-# learn bank list from data (plus known)
+# bank list auto + known (SABB and BSF appear separately)
 bank_list = sorted(set(df_all["bank"].dropna().astype(str))) if not df_all.empty else []
 all_banks = ["All"] + sorted(set(KNOWN_BANKS + bank_list))
 
@@ -246,11 +267,8 @@ with c6:
 with c7:
     to_bank = st.selectbox("To Bank (credit)", all_banks, index=0)
 
-def apply_filters(df: pd.DataFrame,
-                  target: float,
-                  tol: float,
-                  date_from: date | None,
-                  date_to: date | None) -> pd.DataFrame:
+def apply_filters(df: pd.DataFrame, target: float, tol: float,
+                  date_from: date | None, date_to: date | None) -> pd.DataFrame:
     x = df[np.abs(df["abs_amount"] - target) <= tol].copy()
     if date_from:
         x = x[x["date"] >= date_from]
@@ -260,7 +278,7 @@ def apply_filters(df: pd.DataFrame,
 
 if go:
     if df_all.empty:
-        st.warning("No data loaded yet. Load local files from the sidebar first.")
+        st.warning("No data loaded yet. Upload files or load a local folder from the sidebar.")
     else:
         target = parse_amount(amt_str)
         if target is None:
@@ -279,7 +297,6 @@ if go:
                     use_container_width=True
                 )
 
-            # Attempt debit↔credit pairing (respect bank hints if chosen)
             f_hint = from_bank if from_bank != "All" else None
             t_hint = to_bank   if to_bank   != "All" else None
             pairs = pair_debit_credit(hits, date_from, date_to, f_hint, t_hint)
@@ -294,7 +311,6 @@ if go:
                     use_container_width=True
                 )
 
-                # Excel download
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine="openpyxl") as xw:
                     hits.to_excel(xw, index=False, sheet_name="All Hits")
