@@ -1,29 +1,21 @@
-# app.py — Google Drive Amount Search + Inter-bank Pairing
+# app.py — Local Folder Amount Search + Inter-bank Pairing
 # --------------------------------------------------------
 # Run: streamlit run app.py
 
 from __future__ import annotations
-import os, io, re, tempfile
-from datetime import timedelta, date
+import os, io, re
+from datetime import date
 from typing import List, Tuple
 import pandas as pd
 import numpy as np
 import streamlit as st
 
-# ---- Google Drive (service account) ----
-try:
-    from pydrive2.auth import GoogleAuth
-    from pydrive2.drive import GoogleDrive
-    HAS_PYDRIVE2 = True
-except Exception:
-    HAS_PYDRIVE2 = False
-
-st.set_page_config(page_title="Google Drive — Amount Search", layout="wide")
-st.title("🔎 Google Drive — Amount Search (Bank Statements)")
+st.set_page_config(page_title="Local — Amount Search (Bank Statements)", layout="wide")
+st.title("💾 Local Folder — Amount Search (Bank Statements)")
 
 # ---------------- Config ----------------
-DATE_WINDOW_DAYS = 3        # for debit↔credit pairing window
-AMOUNT_TOLERANCE = 0.05     # SAR tolerance for amount match
+DATE_WINDOW_DAYS = 3        # days to search around for debit↔credit pairing
+AMOUNT_TOLERANCE = 0.05     # SAR tolerance
 
 # Column aliases (lowercased)
 HEADER_MAP = {
@@ -62,14 +54,15 @@ def pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
             return df.columns[cols.index(c)]
     return None
 
-def read_any_excel_or_csv(content: bytes, name: str) -> pd.DataFrame:
+def read_any_excel_or_csv(path: str) -> pd.DataFrame:
+    name = os.path.basename(path)
     if name.lower().endswith(".csv"):
         try:
-            return pd.read_csv(io.BytesIO(content))
+            return pd.read_csv(path)
         except Exception:
-            return pd.read_csv(io.BytesIO(content), sep=";")
+            return pd.read_csv(path, sep=";")
     else:
-        return pd.read_excel(io.BytesIO(content))
+        return pd.read_excel(path)
 
 @st.cache_data(show_spinner=False)
 def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
@@ -122,41 +115,6 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
 
     return df[["date","bank","account","narration","ref","amount","abs_amount","balance","direction"]]
 
-# ---------- Google Drive list & download (fixed auth) ----------
-def drive_list_and_download(sa_json: bytes, folder_id: str) -> List[Tuple[bytes,str]]:
-    if not HAS_PYDRIVE2:
-        st.error("pydrive2 not installed. Run: pip install pydrive2")
-        return []
-
-    # Write uploaded JSON to temp file
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp.write(sa_json)
-    tmp.flush()
-
-    # Authenticate with service account JSON
-    gauth = GoogleAuth(settings={
-        "client_config_backend": "service",
-        "service_config": {"client_json_file_path": tmp.name},
-    })
-    gauth.ServiceAuth()  # ensures gauth.service is created
-    drive = GoogleDrive(gauth)
-
-    # List files in folder
-    q = f"'{folder_id}' in parents and trashed=false"
-    file_list = drive.ListFile({'q': q}).GetList()
-
-    out: List[Tuple[bytes,str]] = []
-    for f in file_list:
-        name = f.get('title') or f.get('name')
-        if not name.lower().endswith((".xlsx",".xls",".csv")):
-            continue
-        try:
-            content = f.GetContentBinary()
-            out.append((content, name))
-        except Exception as e:
-            st.warning(f"Failed to download {name}: {e}")
-    return out
-
 def parse_amount(text: str) -> float | None:
     s = text.strip().replace(",", " ").replace("\u066c", " ")
     s = re.sub(r"\s+", "", s)
@@ -196,6 +154,7 @@ def pair_debit_credit(df: pd.DataFrame,
     matches, used_in = [], set()
     for _, o in outs.iterrows():
         cand = ins[(np.abs(ins["abs_amount"] - o["abs_amount"]) <= AMOUNT_TOLERANCE)]
+        # ± window around OUT date
         cand = cand[(pd.to_datetime(cand["date"]) >= pd.to_datetime(o["date"]) - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
                     (pd.to_datetime(cand["date"]) <= pd.to_datetime(o["date"]) + pd.Timedelta(days=DATE_WINDOW_DAYS))]
         cand = cand[~cand.index.isin(used_in)]
@@ -220,55 +179,39 @@ def confirmation_line(row: pd.Series) -> str:
         f"| DR Ref: {row['ref_from'] or ''} | CR Ref: {row['ref_to'] or ''} | Lag(d): {row['lag_days']}"
     )
 
-# ---------------- Sidebar: Source Loader ----------------
+# ---------------- Sidebar: Local Loader ----------------
 st.sidebar.header("📦 Source")
-mode = st.sidebar.radio("Choose source", ["Google Drive", "Local Folder"], index=0)
-frames: List[pd.DataFrame] = []
+st.sidebar.write("**Mode:** Local Folder (no Google Drive)")
 
+folder_local = st.sidebar.text_input("Local folder path (e.g., D:/My Drive/BANK SOA)", value="")
+load_btn = st.sidebar.button("Load local files")
+
+# Persist data between searches
 if "_index" not in st.session_state:
     st.session_state._index = pd.DataFrame()
 
-if mode == "Google Drive":
-    st.sidebar.markdown("**Step 1** — Upload Service Account JSON")
-    sa_file = st.sidebar.file_uploader("Service Account JSON", type=["json"])
-    st.sidebar.markdown("**Step 2** — Paste Drive Folder ID")
-    folder_input = st.sidebar.text_input("Folder ID", value="")
-    if st.sidebar.button("Load from Drive"):
-        if not sa_file or not folder_input.strip():
-            st.error("Upload the JSON and paste Folder ID.")
-        else:
-            files = drive_list_and_download(sa_file.read(), folder_input.strip())
-            for content, name in files:
-                try:
-                    raw = read_any_excel_or_csv(content, name)
-                    norm = normalize_df(raw, name)
-                    frames.append(norm.assign(source=name))
-                except Exception as e:
-                    st.warning(f"Failed to read {name}: {e}")
-            if frames:
-                st.session_state._index = pd.concat(frames, ignore_index=True)
-                st.success(f"Loaded {len(frames)} files from Drive.")
-else:
-    folder_local = st.sidebar.text_input("Local folder path", value="")
-    if st.sidebar.button("Load local"):
-        if not folder_local or not os.path.isdir(folder_local):
-            st.error("Folder not found")
-        else:
-            for name in os.listdir(folder_local):
-                if not name.lower().endswith((".xlsx",".xls",".csv")) or name.startswith("~$"):
-                    continue
-                path = os.path.join(folder_local, name)
-                try:
-                    with open(path, "rb") as f:
-                        content = f.read()
-                    raw = read_any_excel_or_csv(content, name)
-                    norm = normalize_df(raw, name)
-                    frames.append(norm.assign(source=name))
-                except Exception as e:
-                    st.warning(f"Failed to read {name}: {e}")
-            if frames:
-                st.session_state._index = pd.concat(frames, ignore_index=True)
-                st.success(f"Loaded {len(frames)} files from local.")
+if load_btn:
+    frames: List[pd.DataFrame] = []
+    if not folder_local or not os.path.isdir(folder_local):
+        st.error("Folder not found. Please paste a valid local path.")
+    else:
+        names_loaded = []
+        for name in os.listdir(folder_local):
+            if name.startswith("~$"):     # skip temp Excel lock files
+                continue
+            if not name.lower().endswith((".xlsx",".xls",".csv")):
+                continue
+            path = os.path.join(folder_local, name)
+            try:
+                raw = read_any_excel_or_csv(path)
+                norm = normalize_df(raw, name)
+                frames.append(norm.assign(source=name))
+                names_loaded.append(name)
+            except Exception as e:
+                st.warning(f"Failed to read {name}: {e}")
+        if frames:
+            st.session_state._index = pd.concat(frames, ignore_index=True)
+            st.success(f"Loaded {len(frames)} files: {', '.join(names_loaded[:6])}{' …' if len(names_loaded)>6 else ''}")
 
 df_all = st.session_state._index
 
@@ -293,7 +236,7 @@ with c4:
 with c5:
     date_to = st.date_input("To Date", value=None)
 
-# learn bank list from data
+# learn bank list from data (plus known)
 bank_list = sorted(set(df_all["bank"].dropna().astype(str))) if not df_all.empty else []
 all_banks = ["All"] + sorted(set(KNOWN_BANKS + bank_list))
 
@@ -317,7 +260,7 @@ def apply_filters(df: pd.DataFrame,
 
 if go:
     if df_all.empty:
-        st.warning("No data loaded yet. Load from Drive or Local first.")
+        st.warning("No data loaded yet. Load local files from the sidebar first.")
     else:
         target = parse_amount(amt_str)
         if target is None:
