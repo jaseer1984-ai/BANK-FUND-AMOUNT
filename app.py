@@ -1,5 +1,5 @@
-# app.py — Local Amount Search: FROM/TO filtering + Pairing
-# ---------------------------------------------------------
+# app.py — Local Amount Search: FROM/TO filtering + Pairing + DR/CR + Sign Fix
+# ---------------------------------------------------------------------------
 from __future__ import annotations
 import os, io, re
 from datetime import date
@@ -22,14 +22,14 @@ HEADER_MAP = {
                  "narration","narration 1","narration 2","narration 3","narrative","narrative 1","narrative 2","narrative 3"],
     "debit":    ["debit","debit amount","amount dr.","debit (sar)","withdrawal","dr","amount dr"],
     "credit":   ["credit","credit amount","amount cr.","credit (sar)","deposit","cr","amount cr"],
-    "amount":   ["amount","txn amount"],
+    "amount":   ["amount","txn amount","transaction amount"],
     "balance":  ["balance","running balance","balance (sar)"],
-    "account":  ["account","account no","iban"],
+    "account":  ["account","account no","iban","account number"],
     "ref":      ["reference","reference no","reference number","customer reference","txt id","trace","utr","customer reference #"],
     "bank":     ["bank"],
+    "drcr":     ["dr/cr","d/c","dc","dr cr","dr or cr","type","transaction type","debit/credit","tran type","cr/dr"],
 }
 
-# Separate banks (SABB & BSF separate)
 KNOWN_BANKS = ["SNB","SABB","BSF","ARB","ANB","RIB","SIB","NBK","BAB","INM"]
 
 def detect_bank_from_name(name: str) -> str:
@@ -65,6 +65,14 @@ def read_any_excel_or_csv_path(path: str) -> pd.DataFrame:
         except Exception: return pd.read_csv(path, sep=";")
     return pd.read_excel(path)
 
+def normalize_drcr(value: str) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    if v in {"dr","d","debit","-debit-","debits"}: return "DR"
+    if v in {"cr","c","credit","+credit+","credits"}: return "CR"
+    return None
+
 @st.cache_data(show_spinner=False)
 def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
     c_date = pick_col(raw, HEADER_MAP["date"]) or raw.columns[0]
@@ -76,38 +84,39 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
     c_acct = pick_col(raw, HEADER_MAP["account"]) or None
     c_ref  = pick_col(raw, HEADER_MAP["ref"]) or None
     c_bank = pick_col(raw, HEADER_MAP["bank"]) or None
+    c_drcr = pick_col(raw, HEADER_MAP["drcr"]) or None
 
     df = pd.DataFrame()
     df["date"] = pd.to_datetime(raw[c_date], errors="coerce").dt.date
     df["narration"] = raw[c_narr].astype(str).str.strip() if c_narr else ""
-
-    debit  = pd.to_numeric(raw[c_deb], errors="coerce") if c_deb else None
-    credit = pd.to_numeric(raw[c_cred], errors="coerce") if c_cred else None
-
-    if c_amt:
-        amt = pd.to_numeric(raw[c_amt], errors="coerce")
-        if debit is None and credit is None:
-            df["amount"] = amt
-        else:
-            df["amount"] = (credit.fillna(0) if credit is not None else 0) - (debit.fillna(0) if debit is not None else 0)
-    else:
-        if debit is not None or credit is not None:
-            df["amount"] = (credit.fillna(0) if credit is not None else 0) - (debit.fillna(0) if debit is not None else 0)
-        else:
-            df["amount"] = pd.NA
-
     df["balance"] = pd.to_numeric(raw[c_bal], errors="coerce") if c_bal else pd.NA
     df["account"] = raw[c_acct].astype(str).str.strip() if c_acct else ""
     df["ref"] = raw[c_ref].astype(str).str.strip() if c_ref else ""
+    df["bank"] = (raw[c_bank].astype(str).str.strip() if c_bank else detect_bank_from_name(filename_hint))
 
-    if c_bank: df["bank"] = raw[c_bank].astype(str).str.strip()
-    else:      df["bank"] = detect_bank_from_name(filename_hint)
+    debit  = pd.to_numeric(raw[c_deb], errors="coerce") if c_deb else None
+    credit = pd.to_numeric(raw[c_cred], errors="coerce") if c_cred else None
+    amount = pd.to_numeric(raw[c_amt], errors="coerce") if c_amt else None
+
+    # Compute signed amount with as much signal as we can
+    if c_amt is not None and c_deb is None and c_cred is None and c_drcr is not None:
+        drcr = raw[c_drcr].map(normalize_drcr)
+        signed = amount.abs()
+        signed[drcr == "DR"] *= -1
+        signed[drcr == "CR"] *= +1
+        df["amount"] = signed
+    elif c_amt is not None and (c_deb is None and c_cred is None):
+        # Amount only — assume already signed (some banks do)
+        df["amount"] = amount
+    else:
+        # Use debit/credit columns if present
+        df["amount"] = (credit.fillna(0) if credit is not None else 0) - (debit.fillna(0) if debit is not None else 0)
 
     df = df.dropna(subset=["date"]).copy()
     df = df[~df["amount"].isna()].copy()
     df["amount"] = df["amount"].astype(float)
-    df["direction"] = np.where(df["amount"] < 0, "FROM (OUT)", "TO (IN)")
     df["abs_amount"] = df["amount"].abs().round(2)
+    df["direction"] = np.where(df["amount"] < 0, "FROM (OUT)", "TO (IN)")
 
     df["ref"] = df["ref"].str.replace("\n"," ").str.replace("\r"," ")
     df["narration"] = df["narration"].str.replace("\n"," ").str.replace("\r"," ")
@@ -164,7 +173,7 @@ loaded_names: List[str] = []
 
 if mode == "Browse & Upload files":
     uploads = st.sidebar.file_uploader(
-        "Upload one or more statement files (.xlsx, .xls, .csv)",
+        "Upload statements (.xlsx, .xls, .csv)",
         type=["xlsx","xls","csv"],
         accept_multiple_files=True
     )
@@ -236,6 +245,15 @@ with c6:
 with c7:
     to_bank = st.selectbox("To Bank (credit)", all_banks, index=0)
 
+# NEW: sign-fix toggles for tricky exports
+c8, c9 = st.columns(2)
+with c8:
+    from_debits_positive = st.checkbox("From bank debits are positive?", value=False,
+                                       help="Enable if the From Bank's file shows debits as positive numbers.")
+with c9:
+    to_credits_negative = st.checkbox("To bank credits are negative?", value=False,
+                                      help="Enable if the To Bank's file shows credits as negative numbers.")
+
 def filter_base(df: pd.DataFrame, target: float, tol: float,
                 date_from: date | None, date_to: date | None) -> pd.DataFrame:
     x = df[np.abs(df["abs_amount"] - target) <= tol].copy()
@@ -253,15 +271,32 @@ if go:
         else:
             base = filter_base(df_all, target, tol, date_from, date_to)
 
-            # FROM candidates = negatives (OUT), optionally restricted to From Bank
+            # FROM candidates (true negatives)
             outs = base[base["amount"] < 0].copy()
             if from_bank != "All":
                 outs = outs[outs["bank"].str.upper() == from_bank.upper()]
 
-            # TO candidates = positives (IN), optionally restricted to To Bank
+            # If From bank exports debits as positive, include those positives as "assumed OUT"
+            if from_debits_positive and from_bank != "All":
+                extra = base[(base["bank"].str.upper() == from_bank.upper()) & (base["amount"] > 0)].copy()
+                # flip sign just for pairing logic and label direction
+                extra["amount"] = -extra["amount"].abs()
+                extra["abs_amount"] = extra["amount"].abs().round(2)
+                extra["direction"] = "FROM (OUT) [assumed]"
+                outs = pd.concat([outs, extra], ignore_index=True)
+
+            # TO candidates (true positives)
             ins = base[base["amount"] > 0].copy()
             if to_bank != "All":
                 ins = ins[ins["bank"].str.upper() == to_bank.upper()]
+
+            # If To bank exports credits as negative, include those negatives as "assumed IN"
+            if to_credits_negative and to_bank != "All":
+                extra_in = base[(base["bank"].str.upper() == to_bank.upper()) & (base["amount"] < 0)].copy()
+                extra_in["amount"] = extra_in["amount"].abs()
+                extra_in["abs_amount"] = extra_in["amount"].abs().round(2)
+                extra_in["direction"] = "TO (IN) [assumed]"
+                ins = pd.concat([ins, extra_in], ignore_index=True)
 
             st.markdown(f"**Results for SAR {target:,.2f} ± {tol}**")
 
@@ -273,7 +308,7 @@ if go:
                 else:
                     st.dataframe(
                         outs.sort_values(["date","bank"])[
-                            ["date","bank","account","narration","ref","amount","balance","source"]
+                            ["date","bank","account","narration","ref","amount","balance","direction","source"]
                         ],
                         use_container_width=True
                     )
@@ -284,7 +319,7 @@ if go:
                 else:
                     st.dataframe(
                         ins.sort_values(["date","bank"])[
-                            ["date","bank","account","narration","ref","amount","balance","source"]
+                            ["date","bank","account","narration","ref","amount","balance","direction","source"]
                         ],
                         use_container_width=True
                     )
@@ -301,7 +336,6 @@ if go:
                     use_container_width=True
                 )
 
-                # Download
                 outbuf = io.BytesIO()
                 with pd.ExcelWriter(outbuf, engine="openpyxl") as xw:
                     outs.to_excel(xw, index=False, sheet_name="FROM_candidates")
@@ -314,4 +348,4 @@ if go:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.caption("No debit↔credit pairs found. Try a wider date range or remove bank filters.")
+                st.caption("No debit↔credit pairs found. Try enabling a sign-fix toggle, widening dates, or removing bank filters.")
