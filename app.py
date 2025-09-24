@@ -1,7 +1,7 @@
-# app.py — Local Amount Search: FROM/TO filtering + Pairing + DR/CR + Sign Fix
-# ---------------------------------------------------------------------------
+# app.py — Local Amount Search: FROM/TO + Pairing + Raw Row Copy
+# --------------------------------------------------------------
 from __future__ import annotations
-import os, io, re
+import os, io, re, json
 from datetime import date
 from typing import List
 import pandas as pd
@@ -11,7 +11,7 @@ import streamlit as st
 st.set_page_config(page_title="Local — Amount Search (Bank Statements)", layout="wide")
 st.title("💾 Local — Amount Search (Bank Statements)")
 
-# ------------ Config ------------
+# ---------- Config ----------
 DATE_WINDOW_DAYS = 3        # ± days for pairing
 AMOUNT_TOLERANCE = 0.05     # SAR tolerance
 
@@ -30,6 +30,7 @@ HEADER_MAP = {
     "drcr":     ["dr/cr","d/c","dc","dr cr","dr or cr","type","transaction type","debit/credit","tran type","cr/dr"],
 }
 
+# Bank list (SABB & BSF are separate)
 KNOWN_BANKS = ["SNB","SABB","BSF","ARB","ANB","RIB","SIB","NBK","BAB","INM"]
 
 def detect_bank_from_name(name: str) -> str:
@@ -55,14 +56,18 @@ def pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
 
 def read_any_excel_or_csv_bytes(content: bytes, name: str) -> pd.DataFrame:
     if name.lower().endswith(".csv"):
-        try: return pd.read_csv(io.BytesIO(content))
-        except Exception: return pd.read_csv(io.BytesIO(content), sep=";")
+        try:
+            return pd.read_csv(io.BytesIO(content))
+        except Exception:
+            return pd.read_csv(io.BytesIO(content), sep=";")
     return pd.read_excel(io.BytesIO(content))
 
 def read_any_excel_or_csv_path(path: str) -> pd.DataFrame:
     if path.lower().endswith(".csv"):
-        try: return pd.read_csv(path)
-        except Exception: return pd.read_csv(path, sep=";")
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.read_csv(path, sep=";")
     return pd.read_excel(path)
 
 def normalize_drcr(value: str) -> str | None:
@@ -74,7 +79,16 @@ def normalize_drcr(value: str) -> str | None:
     return None
 
 @st.cache_data(show_spinner=False)
-def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
+def normalize_df_with_raw(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
+    """
+    Normalize to common columns AND attach a `_rawdata` column that contains the complete
+    original row (JSON) so we can show/download the exact source row later.
+    The index alignment is preserved so drops keep the same rows.
+    """
+    # Prepare raw string/JSON per-row BEFORE filtering so it follows the index
+    # Use JSON so it's easier to read back
+    raw_json_series = raw.apply(lambda r: json.dumps({str(k): (None if pd.isna(v) else str(v)) for k, v in r.items()}, ensure_ascii=False), axis=1)
+
     c_date = pick_col(raw, HEADER_MAP["date"]) or raw.columns[0]
     c_narr = pick_col(raw, HEADER_MAP["narr"]) or raw.columns[min(1, len(raw.columns)-1)]
     c_deb  = pick_col(raw, HEADER_MAP["debit"])
@@ -86,19 +100,20 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
     c_bank = pick_col(raw, HEADER_MAP["bank"]) or None
     c_drcr = pick_col(raw, HEADER_MAP["drcr"]) or None
 
-    df = pd.DataFrame()
+    df = pd.DataFrame(index=raw.index)
     df["date"] = pd.to_datetime(raw[c_date], errors="coerce").dt.date
     df["narration"] = raw[c_narr].astype(str).str.strip() if c_narr else ""
     df["balance"] = pd.to_numeric(raw[c_bal], errors="coerce") if c_bal else pd.NA
     df["account"] = raw[c_acct].astype(str).str.strip() if c_acct else ""
     df["ref"] = raw[c_ref].astype(str).str.strip() if c_ref else ""
     df["bank"] = (raw[c_bank].astype(str).str.strip() if c_bank else detect_bank_from_name(filename_hint))
+    df["_rawdata"] = raw_json_series  # attach full original row
 
     debit  = pd.to_numeric(raw[c_deb], errors="coerce") if c_deb else None
     credit = pd.to_numeric(raw[c_cred], errors="coerce") if c_cred else None
     amount = pd.to_numeric(raw[c_amt], errors="coerce") if c_amt else None
 
-    # Compute signed amount with as much signal as we can
+    # Compute signed amount with all available signals
     if c_amt is not None and c_deb is None and c_cred is None and c_drcr is not None:
         drcr = raw[c_drcr].map(normalize_drcr)
         signed = amount.abs()
@@ -106,22 +121,21 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
         signed[drcr == "CR"] *= +1
         df["amount"] = signed
     elif c_amt is not None and (c_deb is None and c_cred is None):
-        # Amount only — assume already signed (some banks do)
+        # Amount only — assume already signed
         df["amount"] = amount
     else:
         # Use debit/credit columns if present
         df["amount"] = (credit.fillna(0) if credit is not None else 0) - (debit.fillna(0) if debit is not None else 0)
 
+    # Filter unusable rows and finalize
     df = df.dropna(subset=["date"]).copy()
     df = df[~df["amount"].isna()].copy()
     df["amount"] = df["amount"].astype(float)
     df["abs_amount"] = df["amount"].abs().round(2)
     df["direction"] = np.where(df["amount"] < 0, "FROM (OUT)", "TO (IN)")
-
     df["ref"] = df["ref"].str.replace("\n"," ").str.replace("\r"," ")
     df["narration"] = df["narration"].str.replace("\n"," ").str.replace("\r"," ")
-
-    return df[["date","bank","account","narration","ref","amount","abs_amount","balance","direction"]]
+    return df[["date","bank","account","narration","ref","amount","abs_amount","balance","direction","_rawdata"]]
 
 def parse_amount(text: str) -> float | None:
     s = text.strip().replace(",", " ").replace("\u066c", " ")
@@ -148,12 +162,14 @@ def pair_debit_credit(outs: pd.DataFrame, ins: pd.DataFrame) -> pd.DataFrame:
         m = cand.sort_values("score").iloc[0]
         used_in.add(m.name)
         matches.append({
+            # summarized fields
             "date_from": o["date"], "bank_from": o["bank"], "acct_from": o["account"],
             "ref_from":  o["ref"],  "narr_from": o["narration"], "amt_from": o["amount"],
             "date_to":   m["date"], "bank_to":   m["bank"], "acct_to":   m["account"],
             "ref_to":    m["ref"],  "narr_to":   m["narration"], "amt_to":   m["amount"],
-            "abs_amount": o["abs_amount"],
-            "lag_days":   int(abs(pd.to_datetime(m["date"]) - pd.to_datetime(o["date"])).days),
+            "abs_amount": o["abs_amount"], "lag_days": int(abs(pd.to_datetime(m["date"]) - pd.to_datetime(o["date"])).days),
+            # raw rows (complete)
+            "raw_from": o.get("_rawdata",""), "raw_to": m.get("_rawdata","")
         })
     return pd.DataFrame(matches)
 
@@ -161,7 +177,7 @@ def confirmation_line(row: pd.Series) -> str:
     return (f"DONE ✅ | {row['bank_from']}→{row['bank_to']} | SAR {row['abs_amount']:,.2f} "
             f"| DR Ref: {row['ref_from'] or ''} | CR Ref: {row['ref_to'] or ''} | Lag(d): {row['lag_days']}")
 
-# ------------ Sidebar: Source ------------
+# ---------- Sidebar: Source ----------
 st.sidebar.header("📦 Source")
 mode = st.sidebar.radio("Choose input method", ["Browse & Upload files", "Local Folder path"], index=0)
 
@@ -184,7 +200,7 @@ if mode == "Browse & Upload files":
             for up in uploads:
                 try:
                     raw = read_any_excel_or_csv_bytes(up.read(), up.name)
-                    norm = normalize_df(raw, up.name)
+                    norm = normalize_df_with_raw(raw, up.name)
                     frames.append(norm.assign(source=up.name))
                     loaded_names.append(up.name)
                 except Exception as e:
@@ -204,7 +220,7 @@ else:
                 path = os.path.join(folder_local, name)
                 try:
                     raw = read_any_excel_or_csv_path(path)
-                    norm = normalize_df(raw, name)
+                    norm = normalize_df_with_raw(raw, name)
                     frames.append(norm.assign(source=name))
                     loaded_names.append(name)
                 except Exception as e:
@@ -219,14 +235,15 @@ with st.expander("Preview (first 100 rows)", expanded=False):
     if not df_all.empty:
         st.dataframe(df_all.head(100), use_container_width=True)
 
-# ------------ Filters & Search ------------
+# ---------- Filters & Search ----------
 st.subheader("Search by Amount & Filters")
 
 c1, c2, c3 = st.columns([2,1,1])
 with c1:
     amt_str = st.text_input("Amount", value="1000000")
 with c2:
-    tol = st.number_input("Tolerance (SAR)", min_value=0.0, max_value=50.0, value=AMOUNT_TOLERANCE, step=0.05)
+    tol = st.number_input("Tolerance (SAR)", min_value=0.0, max_value=50.0,
+                          value=AMOUNT_TOLERANCE, step=0.05)
 with c3:
     go = st.button("Search")
 
@@ -245,14 +262,14 @@ with c6:
 with c7:
     to_bank = st.selectbox("To Bank (credit)", all_banks, index=0)
 
-# NEW: sign-fix toggles for tricky exports
+# Sign-fix toggles
 c8, c9 = st.columns(2)
 with c8:
     from_debits_positive = st.checkbox("From bank debits are positive?", value=False,
-                                       help="Enable if the From Bank's file shows debits as positive numbers.")
+                                       help="Enable if From Bank's export lists debits as positive.")
 with c9:
     to_credits_negative = st.checkbox("To bank credits are negative?", value=False,
-                                      help="Enable if the To Bank's file shows credits as negative numbers.")
+                                      help="Enable if To Bank's export lists credits as negative.")
 
 def filter_base(df: pd.DataFrame, target: float, tol: float,
                 date_from: date | None, date_to: date | None) -> pd.DataFrame:
@@ -276,10 +293,9 @@ if go:
             if from_bank != "All":
                 outs = outs[outs["bank"].str.upper() == from_bank.upper()]
 
-            # If From bank exports debits as positive, include those positives as "assumed OUT"
+            # If From bank exports debits as positive, include those positives as assumed OUT
             if from_debits_positive and from_bank != "All":
                 extra = base[(base["bank"].str.upper() == from_bank.upper()) & (base["amount"] > 0)].copy()
-                # flip sign just for pairing logic and label direction
                 extra["amount"] = -extra["amount"].abs()
                 extra["abs_amount"] = extra["amount"].abs().round(2)
                 extra["direction"] = "FROM (OUT) [assumed]"
@@ -290,7 +306,7 @@ if go:
             if to_bank != "All":
                 ins = ins[ins["bank"].str.upper() == to_bank.upper()]
 
-            # If To bank exports credits as negative, include those negatives as "assumed IN"
+            # If To bank exports credits as negative, include those negatives as assumed IN
             if to_credits_negative and to_bank != "All":
                 extra_in = base[(base["bank"].str.upper() == to_bank.upper()) & (base["amount"] < 0)].copy()
                 extra_in["amount"] = extra_in["amount"].abs()
@@ -336,15 +352,30 @@ if go:
                     use_container_width=True
                 )
 
+                # Show COMPLETE original rows for each pair (FROM & TO)
+                for i, r in pairs.iterrows():
+                    with st.expander(f"🔎 Pair {i+1}: {r['bank_from']} → {r['bank_to']} | SAR {r['abs_amount']:,.2f}"):
+                        st.markdown("**FROM raw row (complete):**")
+                        try:
+                            st.json(json.loads(r["raw_from"]))
+                        except Exception:
+                            st.text(r["raw_from"])
+                        st.markdown("**TO raw row (complete):**")
+                        try:
+                            st.json(json.loads(r["raw_to"]))
+                        except Exception:
+                            st.text(r["raw_to"])
+
+                # Build Excel with FROM/TO candidates + Pairs (including raw rows)
                 outbuf = io.BytesIO()
                 with pd.ExcelWriter(outbuf, engine="openpyxl") as xw:
                     outs.to_excel(xw, index=False, sheet_name="FROM_candidates")
                     ins.to_excel(xw, index=False, sheet_name="TO_candidates")
-                    pairs.to_excel(xw, index=False, sheet_name="Pairs")
+                    pairs.to_excel(xw, index=False, sheet_name="Pairs_with_RawRows")
                 st.download_button(
-                    "Download Excel (FROM, TO, Pairs)",
+                    "Download Excel (FROM, TO, Pairs + Raw Rows)",
                     data=outbuf.getvalue(),
-                    file_name=f"Amount_{int(round(target))}_from_to_pairs.xlsx",
+                    file_name=f"Amount_{int(round(target))}_from_to_pairs_raw.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
