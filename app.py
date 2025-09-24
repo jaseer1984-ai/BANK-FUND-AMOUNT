@@ -121,13 +121,10 @@ def _coerce_number(x):
     if pd.isna(x): return np.nan
     s = str(x).strip()
     if not s: return np.nan
-    # Arabic comma and spaces
-    s = s.replace("\u066c", ",").replace(" ", "")
-    # Parentheses negatives
+    s = s.replace("\u066c", ",").replace(" ", "")  # Arabic comma & spaces
     neg = s.startswith("(") and s.endswith(")")
     s = s.strip("()")
-    # remove thousand comma
-    s = s.replace(",", "")
+    s = s.replace(",", "")  # thousand sep
     if s in {"-", "--"}: return 0.0
     try:
         val = float(s)
@@ -159,6 +156,19 @@ def read_any_excel_or_csv_path(path: str) -> pd.DataFrame:
     df = df.dropna(how="all", axis=1).dropna(how="all")
     return df
 
+# Keep duplicate headers: JSON keys with __2, __3 suffixes
+def _row_to_unique_json(row: pd.Series) -> str:
+    seen, out = {}, {}
+    for k, v in row.items():
+        key = str(k)
+        if key in seen:
+            seen[key] += 1
+            key = f"{key}__{seen[key]}"
+        else:
+            seen[key] = 1
+        out[key] = None if pd.isna(v) else str(v)
+    return json.dumps(out, ensure_ascii=False)
+
 # -------------------- Normalization (keeps RAW row JSON) --------------------
 def normalize_df_with_raw_and_mapping(raw: pd.DataFrame, filename_hint: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     mapping: Dict[str, str] = {}
@@ -174,10 +184,7 @@ def normalize_df_with_raw_and_mapping(raw: pd.DataFrame, filename_hint: str) -> 
         mapping[key] = ""
         return ""
 
-    raw_json_series = raw.apply(
-        lambda r: json.dumps({str(k): (None if pd.isna(v) else str(v)) for k, v in r.items()}, ensure_ascii=False),
-        axis=1
-    )
+    raw_json_series = raw.apply(_row_to_unique_json, axis=1)
 
     c_date = matched("date") or raw.columns[0]
     c_narr = matched("narr") or raw.columns[min(1, len(raw.columns)-1)]
