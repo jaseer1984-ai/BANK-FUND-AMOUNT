@@ -1,7 +1,5 @@
-# app.py — Local Amount Search + Pairing (Folder OR Upload)
+# app.py — Local Amount Search: FROM/TO filtering + Pairing
 # ---------------------------------------------------------
-# Run: streamlit run app.py
-
 from __future__ import annotations
 import os, io, re
 from datetime import date
@@ -31,7 +29,7 @@ HEADER_MAP = {
     "bank":     ["bank"],
 }
 
-# Separate banks (SABB & BSF separate now)
+# Separate banks (SABB & BSF separate)
 KNOWN_BANKS = ["SNB","SABB","BSF","ARB","ANB","RIB","SIB","NBK","BAB","INM"]
 
 def detect_bank_from_name(name: str) -> str:
@@ -57,18 +55,14 @@ def pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
 
 def read_any_excel_or_csv_bytes(content: bytes, name: str) -> pd.DataFrame:
     if name.lower().endswith(".csv"):
-        try:
-            return pd.read_csv(io.BytesIO(content))
-        except Exception:
-            return pd.read_csv(io.BytesIO(content), sep=";")
+        try: return pd.read_csv(io.BytesIO(content))
+        except Exception: return pd.read_csv(io.BytesIO(content), sep=";")
     return pd.read_excel(io.BytesIO(content))
 
 def read_any_excel_or_csv_path(path: str) -> pd.DataFrame:
     if path.lower().endswith(".csv"):
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return pd.read_csv(path, sep=";")
+        try: return pd.read_csv(path)
+        except Exception: return pd.read_csv(path, sep=";")
     return pd.read_excel(path)
 
 @st.cache_data(show_spinner=False)
@@ -106,10 +100,8 @@ def normalize_df(raw: pd.DataFrame, filename_hint: str) -> pd.DataFrame:
     df["account"] = raw[c_acct].astype(str).str.strip() if c_acct else ""
     df["ref"] = raw[c_ref].astype(str).str.strip() if c_ref else ""
 
-    if c_bank:
-        df["bank"] = raw[c_bank].astype(str).str.strip()
-    else:
-        df["bank"] = detect_bank_from_name(filename_hint)
+    if c_bank: df["bank"] = raw[c_bank].astype(str).str.strip()
+    else:      df["bank"] = detect_bank_from_name(filename_hint)
 
     df = df.dropna(subset=["date"]).copy()
     df = df[~df["amount"].isna()].copy()
@@ -126,8 +118,7 @@ def parse_amount(text: str) -> float | None:
     s = text.strip().replace(",", " ").replace("\u066c", " ")
     s = re.sub(r"\s+", "", s)
     if not s: return None
-    try:
-        return float(s)
+    try: return float(s)
     except Exception:
         m = re.search(r"([0-9][0-9,]*)\.?([0-9]{0,2})", s)
         if not m: return None
@@ -135,25 +126,8 @@ def parse_amount(text: str) -> float | None:
         dec = m.group(2) or ""
         return float(f"{num}.{dec}" if dec else num)
 
-def pair_debit_credit(df: pd.DataFrame,
-                      date_from: date | None,
-                      date_to: date | None,
-                      from_bank_hint: str | None,
-                      to_bank_hint: str | None) -> pd.DataFrame:
-    if df.empty: return df
-    outs = df[df["amount"] < 0].copy()
-    ins  = df[df["amount"] > 0].copy()
-
-    if from_bank_hint:
-        outs = outs[outs["bank"].str.upper() == from_bank_hint.upper()]
-    if to_bank_hint:
-        ins  = ins[ins["bank"].str.upper() == to_bank_hint.upper()]
-
-    if date_from:
-        outs = outs[outs["date"] >= date_from]; ins = ins[ins["date"] >= date_from]
-    if date_to:
-        outs = outs[outs["date"] <= date_to];   ins = ins[ins["date"] <= date_to]
-
+def pair_debit_credit(outs: pd.DataFrame, ins: pd.DataFrame) -> pd.DataFrame:
+    if outs.empty or ins.empty: return pd.DataFrame()
     matches, used_in = [], set()
     for _, o in outs.iterrows():
         cand = ins[(np.abs(ins["abs_amount"] - o["abs_amount"]) <= AMOUNT_TOLERANCE)]
@@ -175,16 +149,13 @@ def pair_debit_credit(df: pd.DataFrame,
     return pd.DataFrame(matches)
 
 def confirmation_line(row: pd.Series) -> str:
-    return (
-        f"DONE ✅ | {row['bank_from']}→{row['bank_to']} | SAR {row['abs_amount']:,.2f} "
-        f"| DR Ref: {row['ref_from'] or ''} | CR Ref: {row['ref_to'] or ''} | Lag(d): {row['lag_days']}"
-    )
+    return (f"DONE ✅ | {row['bank_from']}→{row['bank_to']} | SAR {row['abs_amount']:,.2f} "
+            f"| DR Ref: {row['ref_from'] or ''} | CR Ref: {row['ref_to'] or ''} | Lag(d): {row['lag_days']}")
 
 # ------------ Sidebar: Source ------------
 st.sidebar.header("📦 Source")
 mode = st.sidebar.radio("Choose input method", ["Browse & Upload files", "Local Folder path"], index=0)
 
-# keep data between actions
 if "_index" not in st.session_state:
     st.session_state._index = pd.DataFrame()
 
@@ -212,8 +183,7 @@ if mode == "Browse & Upload files":
             if frames:
                 st.session_state._index = pd.concat(frames, ignore_index=True)
                 st.success(f"Loaded {len(frames)} files: {', '.join(loaded_names[:6])}{' …' if len(loaded_names)>6 else ''}")
-
-else:  # Local Folder path
+else:
     folder_local = st.sidebar.text_input("Local folder path (e.g., D:/BANK SOA)", value="")
     if st.sidebar.button("Load local folder"):
         if not folder_local or not os.path.isdir(folder_local):
@@ -257,7 +227,6 @@ with c4:
 with c5:
     date_to = st.date_input("To Date", value=None)
 
-# bank list auto + known (SABB and BSF appear separately)
 bank_list = sorted(set(df_all["bank"].dropna().astype(str))) if not df_all.empty else []
 all_banks = ["All"] + sorted(set(KNOWN_BANKS + bank_list))
 
@@ -267,13 +236,11 @@ with c6:
 with c7:
     to_bank = st.selectbox("To Bank (credit)", all_banks, index=0)
 
-def apply_filters(df: pd.DataFrame, target: float, tol: float,
-                  date_from: date | None, date_to: date | None) -> pd.DataFrame:
+def filter_base(df: pd.DataFrame, target: float, tol: float,
+                date_from: date | None, date_to: date | None) -> pd.DataFrame:
     x = df[np.abs(df["abs_amount"] - target) <= tol].copy()
-    if date_from:
-        x = x[x["date"] >= date_from]
-    if date_to:
-        x = x[x["date"] <= date_to]
+    if date_from: x = x[x["date"] >= date_from]
+    if date_to:   x = x[x["date"] <= date_to]
     return x
 
 if go:
@@ -284,25 +251,48 @@ if go:
         if target is None:
             st.error("Please enter a valid number, e.g., 1000000 or 1,000,000")
         else:
-            hits = apply_filters(df_all, target, tol, date_from, date_to)
+            base = filter_base(df_all, target, tol, date_from, date_to)
+
+            # FROM candidates = negatives (OUT), optionally restricted to From Bank
+            outs = base[base["amount"] < 0].copy()
+            if from_bank != "All":
+                outs = outs[outs["bank"].str.upper() == from_bank.upper()]
+
+            # TO candidates = positives (IN), optionally restricted to To Bank
+            ins = base[base["amount"] > 0].copy()
+            if to_bank != "All":
+                ins = ins[ins["bank"].str.upper() == to_bank.upper()]
 
             st.markdown(f"**Results for SAR {target:,.2f} ± {tol}**")
-            if hits.empty:
-                st.info("No lines found with the selected amount and date filters.")
-            else:
-                st.dataframe(
-                    hits.sort_values(["date","bank","direction"])[
-                        ["date","bank","account","narration","ref","amount","balance","direction","source"]
-                    ],
-                    use_container_width=True
-                )
 
-            f_hint = from_bank if from_bank != "All" else None
-            t_hint = to_bank   if to_bank   != "All" else None
-            pairs = pair_debit_credit(hits, date_from, date_to, f_hint, t_hint)
+            colA, colB = st.columns(2)
+            with colA:
+                st.markdown("**FROM candidates (debit / OUT)**")
+                if outs.empty:
+                    st.caption("No FROM (debit) rows in the filter.")
+                else:
+                    st.dataframe(
+                        outs.sort_values(["date","bank"])[
+                            ["date","bank","account","narration","ref","amount","balance","source"]
+                        ],
+                        use_container_width=True
+                    )
+            with colB:
+                st.markdown("**TO candidates (credit / IN)**")
+                if ins.empty:
+                    st.caption("No TO (credit) rows in the filter.")
+                else:
+                    st.dataframe(
+                        ins.sort_values(["date","bank"])[
+                            ["date","bank","account","narration","ref","amount","balance","source"]
+                        ],
+                        use_container_width=True
+                    )
 
+            # Pair ONLY the filtered candidates
+            pairs = pair_debit_credit(outs, ins)
             if not pairs.empty:
-                st.subheader("Possible transfer pairs (same amount within ± days)")
+                st.subheader("Matched transfer pairs")
                 pairs["Confirmation"] = pairs.apply(confirmation_line, axis=1)
                 st.dataframe(
                     pairs[["date_from","bank_from","acct_from","ref_from",
@@ -311,15 +301,17 @@ if go:
                     use_container_width=True
                 )
 
-                out = io.BytesIO()
-                with pd.ExcelWriter(out, engine="openpyxl") as xw:
-                    hits.to_excel(xw, index=False, sheet_name="All Hits")
+                # Download
+                outbuf = io.BytesIO()
+                with pd.ExcelWriter(outbuf, engine="openpyxl") as xw:
+                    outs.to_excel(xw, index=False, sheet_name="FROM_candidates")
+                    ins.to_excel(xw, index=False, sheet_name="TO_candidates")
                     pairs.to_excel(xw, index=False, sheet_name="Pairs")
                 st.download_button(
-                    "Download Excel (Hits + Pairs)",
-                    data=out.getvalue(),
-                    file_name=f"AmountSearch_{int(round(target))}.xlsx",
+                    "Download Excel (FROM, TO, Pairs)",
+                    data=outbuf.getvalue(),
+                    file_name=f"Amount_{int(round(target))}_from_to_pairs.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.caption("No debit↔credit pairs found. Counter-entry may post later or is in another date window.")
+                st.caption("No debit↔credit pairs found. Try a wider date range or remove bank filters.")
